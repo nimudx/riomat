@@ -123,3 +123,49 @@ fn tabla_con_coma_decimal_y_secciones_interpoladas() {
     let falta = leer_tabla_texto("River Sta\tProfile\tQ Total\n1\tPF 1\t5\n");
     assert!(falta.unwrap_err().contains("Top Width"));
 }
+
+/// Exporta con los datos reales; si `RIOMAT_EXPORT_DIR` está definida, deja allí los archivos para inspeccionarlos.
+#[test]
+fn exportar_todo_con_datos_reales() {
+    let d = datos!();
+    let h = hidraulica(&d);
+    let par = Parametros { campo_cada: Some(8), ..Default::default() };
+    let esc = exportar::escenarios(&h, &par).unwrap();
+    assert_eq!(esc.len(), 9);
+    let p = &h.perfiles[1];
+    let dl = coeficientes(Metodo::SeoCheong, &p.u, &p.a, &p.b, &p.r, &p.sf);
+    let res = simular_entrada(p.q, &p.x, &p.a, &dl, &par).unwrap();
+    let archivos = vec!["a.xlsx".to_string(), "b.xlsx".to_string()];
+    let m = exportar::Mostrado { perfil: &p.nombre, metodo: Metodo::SeoCheong, resultado: &res, archivos: &archivos };
+    let dir = std::env::var_os("RIOMAT_EXPORT_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join(format!("riomat-real-{}", std::process::id())));
+    exportar::escribir(&dir, &h, &par, &esc, &m, &[], vec![]).unwrap();
+    let resumen = std::fs::read_to_string(dir.join("resumen_escenarios.csv")).unwrap();
+    assert_eq!(resumen.lines().count(), 10);
+    if std::env::var_os("RIOMAT_EXPORT_DIR").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn sensibilidad_45_coincide_con_python() {
+    let d = datos!();
+    let ruta = d.join("sensibilidad_45_python.csv");
+    if !ruta.exists() {
+        eprintln!("OMITIDO: falta sensibilidad_45_python.csv");
+        return;
+    }
+    let h = hidraulica(&d);
+    let crit = analisis::criticas_por_defecto(&h);
+    assert_eq!(crit, vec![2175.0, 1221.0]);
+    let filas = analisis::sensibilidad(&h, &Parametros::default(), &analisis::ensayos(2.0, 10.0), &crit).unwrap();
+    let mut rdr = csv::Reader::from_path(ruta).unwrap();
+    let mut n = 0;
+    for rec in rdr.records() {
+        let rec = rec.unwrap();
+        let f = filas.iter().find(|f| f.perfil == rec[0].trim() && f.metodo.clave() == &rec[1] && f.ensayo.clave() == &rec[2]).unwrap_or_else(|| panic!("sin fila para {:?}", rec));
+        assert_relative_eq!(f.t50_min.unwrap(), rec[3].parse::<f64>().unwrap(), max_relative = 1e-9);
+        assert_relative_eq!(f.t95_min.unwrap(), rec[4].parse::<f64>().unwrap(), max_relative = 1e-9);
+        n += 1;
+    }
+    assert_eq!(n, 45);
+}

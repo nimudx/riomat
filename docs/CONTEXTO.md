@@ -34,13 +34,12 @@ Poco texto en pantalla: la verificación vive en una insignia (✓ / ⚠ N) que 
 
 ## Hecho
 Núcleo validado · entrada por tabla de HEC-RAS (pegar, abrir, arrastrar) · parámetros editables + Calcular ·
-exportación de figuras PNG/SVG/PDF (una o las 4) · selector de archivos · pestañas · flujos de Windows y Linux en GitHub.
+exportación de figuras PNG/SVG/PDF (una o las 4) · **Exportar todo** (CSV + Excel + figuras + `graficar_matplotlib.py` en `~/Documents/riomat-export/riomat-<marca>/`, módulo `riomat-core/src/exportar.rs`) · selector de archivos · pestañas · flujos de Windows y Linux en GitHub.
 
 ## Pendiente (orden propuesto)
-1. **Exportar todo**: CSV y Excel (resultados, curvas, D_L, verificación) + script de matplotlib en la carpeta exportada
-   (híbrido: la app no depende de Python; las figuras finales de calidad de revista salen de matplotlib).
-2. **Sensibilidad** (45 ensayos: D_L ×0.5 y ×2, área ±10 % en las secciones 2175 y 1221) y **auditoría de D_L** (108 valores);
-   viene de `04_Codigo_Python` (sus rutas `/mnt/data` están rotas).
+1. ~~Exportar todo~~ (hecho; falta informe PDF de una página con parámetros, tablas y avisos).
+2. ~~Sensibilidad y auditoría de D_L~~ (hecho: `riomat-core/src/analisis.rs`, pestañas Sensibilidad y Auditoría D_L, validado contra Python a 1e-9;
+   factores y secciones críticas editables; sale en Exportar todo). Origen: `04_Codigo_Python` (sus rutas `/mnt/data` están rotas).
 3. **Comparar los tres caudales** en una pantalla; mapa espacio-tiempo en Figuras.
 4. Probar con una **tabla real de HEC-RAS** (hasta ahora solo con tablas armadas desde los Excel); `.hdf`/`.O01` sin soporte.
 5. Convergencia en malla y tiempo con la condición de entrada nueva.

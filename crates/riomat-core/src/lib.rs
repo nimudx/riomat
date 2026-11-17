@@ -5,7 +5,9 @@
 //! `modelo_entrada_aguas_arriba.py`. No contiene nada específico de un sistema
 //! operativo, para compilar igual en Linux y Windows.
 
+pub mod analisis;
 pub mod dispersion;
+pub mod exportar;
 pub mod hidraulica;
 pub mod solver;
 pub mod tabla;

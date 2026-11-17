@@ -6,6 +6,7 @@ use std::time::Duration;
 use riomat_core::solver::interp;
 use riomat_plot::{Figura, a_svg, svg_a_pdf, svg_a_png};
 use riomat_core::*;
+use riomat_core::{analisis, exportar};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
@@ -42,6 +43,8 @@ enum Pestana {
     Simulacion,
     Figuras,
     Datos,
+    Sensibilidad,
+    Auditoria,
 }
 
 struct Vista {
@@ -66,6 +69,11 @@ pub struct Riomat {
     pestana: Pestana,
     fig_sel: usize,
     ver_avisos: bool,
+    sens: Option<Vec<analisis::FilaSens>>,
+    sens_error: Option<String>,
+    criticas: Vec<f64>,
+    in_kd: Entity<InputState>,
+    in_pa: Entity<InputState>,
     durs: Vec<f64>,
     par: Parametros,
     in_masa: Entity<InputState>,
@@ -86,7 +94,9 @@ impl Riomat {
             campo(texto_num(par.dt), "s", window, cx),
             campo(texto_num(par.t_final / 60.0), "min", window, cx),
         );
-        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let in_kd = campo("2".into(), "×", window, cx);
+        let in_pa = campo("10".into(), "%", window, cx);
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
         let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
         if !rutas.is_empty() {
             s.cargar(&rutas);
@@ -117,10 +127,12 @@ impl Riomat {
     }
 
     fn aplicar(&mut self, res: Result<Hidraulica, String>, archivos: Vec<String>) {
+        self.sens = None;
         match res {
             Ok(h) => {
                 self.archivos = archivos;
                 self.perfil = self.perfil.min(h.perfiles.len().saturating_sub(1));
+                self.criticas = analisis::criticas_por_defecto(&h);
                 self.hid = Some(h);
                 self.error = None;
                 self.recalcular();
@@ -205,6 +217,7 @@ impl Riomat {
                 self.dur = self.durs.iter().position(|d| (d - dur).abs() < 1e-9).unwrap_or(0);
                 self.par = par;
                 self.error = None;
+                self.sens = None;
                 self.recalcular();
                 self.frame = self.frame.min(self.n_frames().saturating_sub(1));
             }
@@ -226,6 +239,7 @@ impl Riomat {
         self.poner(&self.in_tf.clone(), texto_num(p.t_final / 60.0), window, cx);
         self.durs = DURACIONES_BASE.to_vec();
         self.par = p;
+        self.sens = None;
         self.dur = 1;
         self.error = None;
         self.recalcular();
@@ -310,6 +324,16 @@ fn tarjeta(titulo: &'static str, leyenda: Vec<(String, u32)>, cuerpo: impl IntoE
     v_flex().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).overflow_hidden().min_w_0().child(cab).child(v_flex().gap_2().p_3().child(leyenda).child(cuerpo))
 }
 
+/// Tabla de texto con columnas de igual ancho.
+fn tabla_txt(cab: &[&str], filas: Vec<Vec<String>>) -> Div {
+    let celda = |t: String, cab: bool| div().flex_1().min_w_0().text_size(px(12.)).text_color(rgb(if cab { MUTED } else { TEXT })).font_weight(if cab { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }).child(t);
+    let mut t = v_flex().child(h_flex().min_h(px(32.)).items_center().px_3().gap_2().bg(rgb(HEADER)).children(cab.iter().map(|c| celda(c.to_string(), true))));
+    for f in filas {
+        t = t.child(h_flex().min_h(px(30.)).items_center().px_3().gap_2().border_t_1().border_color(rgb(BORDER)).children(f.into_iter().map(|c| celda(c, false))));
+    }
+    t
+}
+
 fn fila(etiqueta: &'static str, valor: String) -> Div {
     h_flex()
         .justify_between()
@@ -388,6 +412,8 @@ impl Render for Riomat {
             Pestana::Simulacion => self.centro(cx).into_any_element(),
             Pestana::Figuras => self.vista_figuras(cx).into_any_element(),
             Pestana::Datos => self.vista_datos(cx).into_any_element(),
+            Pestana::Sensibilidad => self.vista_sensibilidad(cx).into_any_element(),
+            Pestana::Auditoria => self.vista_auditoria(cx).into_any_element(),
         };
         let cuerpo = h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(centro);
         let cuerpo = if self.ver_avisos { cuerpo.child(self.panel_der(cx)) } else { cuerpo };
@@ -459,12 +485,15 @@ impl Riomat {
                 this.ver_avisos = !this.ver_avisos;
                 cx.notify();
             }));
-        let pestanas = h_flex().gap_1().children([(Pestana::Simulacion, "Simulación"), (Pestana::Figuras, "Figuras"), (Pestana::Datos, "Datos")].into_iter().enumerate().map(|(i, (p, t))| {
+        let pestanas = h_flex().gap_1().children([(Pestana::Simulacion, "Simulación"), (Pestana::Figuras, "Figuras"), (Pestana::Datos, "Datos"), (Pestana::Sensibilidad, "Sensibilidad"), (Pestana::Auditoria, "Auditoría D_L")].into_iter().enumerate().map(|(i, (p, t))| {
             let activa = self.pestana == p;
             div().id(("pest", i)).h(px(48.)).px_3().flex().items_center().cursor_pointer().text_size(px(13.)).font_weight(if activa { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .text_color(rgb(if activa { ACCENT } else { MUTED })).border_b_2().border_color(if activa { rgb(ACCENT) } else { rgb(PANEL) }).child(t)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.pestana = p;
+                    if p == Pestana::Sensibilidad && this.sens.is_none() {
+                        this.calcular_sens(cx);
+                    }
                     cx.notify();
                 }))
         }));
@@ -875,7 +904,7 @@ impl Riomat {
             .child(boton("g_png", "PNG", ACCENT).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "png", cx))))
             .child(boton("g_svg", "SVG", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "svg", cx))))
             .child(boton("g_pdf", "PDF", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "pdf", cx))))
-            .child(boton("g_todas", "Guardar las 4", RESET).on_click(cx.listener(|this, _, _, cx| this.exportar_figuras(cx))))
+            .child(boton("g_todo", "Exportar todo", ACCENT).on_click(cx.listener(|this, _, _, cx| this.exportar_todo(cx))))
             .children(self.export_msg.clone().map(|m| div().text_size(px(11.5)).text_color(rgb(MUTED)).child(m)));
         v_flex()
             .id("figuras")
@@ -887,6 +916,105 @@ impl Riomat {
             .p_4()
             .child(h_flex().gap_4().items_start().child(lista).child(v_flex().flex_1().min_w_0().gap_3().child(vista).child(botones)))
             .into_any_element()
+    }
+
+    /// Lee los factores, corre los 45 ensayos y guarda el resultado.
+    fn calcular_sens(&mut self, cx: &mut Context<Self>) {
+        let Some(h) = self.hid.clone() else { return };
+        let kd = self.leer_campo(&self.in_kd, "Factor de D_L", cx);
+        let pa = self.leer_campo(&self.in_pa, "Variación del área", cx);
+        let r = (|| -> Result<Vec<analisis::FilaSens>, String> {
+            let (kd, pa) = (kd?, pa?);
+            if !(kd > 1.0) {
+                return Err("El factor de D_L debe ser mayor que 1 (por ejemplo 2: ensaya ×0.5 y ×2).".into());
+            }
+            if !(pa > 0.0 && pa < 100.0) {
+                return Err("La variación del área debe estar entre 0 y 100 %.".into());
+            }
+            let par = Parametros { duracion_pulso: self.durs[self.dur], campo_cada: None, ..self.par.clone() };
+            analisis::sensibilidad(&h, &par, &analisis::ensayos(kd, pa), &self.criticas)
+        })();
+        match r {
+            Ok(f) => {
+                self.sens = Some(f);
+                self.sens_error = None;
+            }
+            Err(e) => {
+                self.sens = None;
+                self.sens_error = Some(e);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Pestaña Sensibilidad: ensayos sobre D_L y el área de las secciones críticas.
+    fn vista_sensibilidad(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let p0 = &h.perfiles[0];
+        let chips = h_flex().gap_1p5().flex_wrap().children(p0.secciones.iter().enumerate().map(|(i, s)| {
+            let s = *s;
+            opcion(("crit", i), format!("{s:.0}"), self.criticas.contains(&s), None).on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(k) = this.criticas.iter().position(|c| *c == s) {
+                    this.criticas.remove(k);
+                } else {
+                    this.criticas.push(s);
+                }
+                this.sens = None;
+                cx.notify();
+            }))
+        }));
+        let config = tarjeta("Ensayos", vec![], v_flex().gap_3()
+            .child(h_flex().gap_6().items_center().flex_wrap()
+                .child(self.campo("D_L ×(1/f) y ×f, f =", "", &self.in_kd))
+                .child(self.campo("Área ±", "%", &self.in_pa))
+                .child(boton("calc_sens", "Calcular", ACCENT).on_click(cx.listener(|this, _, _, cx| this.calcular_sens(cx)))))
+            .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("Secciones críticas (el área se cambia solo ahí):"))
+            .child(chips)
+            .children(self.sens_error.clone().map(|e| div().text_size(px(12.)).text_color(rgb(ERR)).child(e))));
+        let base = v_flex().id("sens").flex_1().h_full().min_w_0().overflow_y_scroll().gap_3().p_4().child(config);
+        let Some(filas) = &self.sens else {
+            return base.child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("Pulsa Calcular para correr los ensayos (3 caudales × 3 correlaciones × 5 ensayos).")).into_any_element();
+        };
+        let perfil = &h.perfiles[self.perfil].nombre;
+        let ens: Vec<analisis::Ensayo> = filas.iter().filter(|f| &f.perfil == perfil && f.metodo == METODOS[0]).map(|f| f.ensayo.clone()).collect();
+        let fmtv = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or("–".into());
+        let fmtp = |v: Option<f64>| v.map(|x| format!("{x:+.1} %")).unwrap_or("–".into());
+        let cab: Vec<String> = std::iter::once("Ensayo".to_string()).chain(METODOS.iter().map(|m| format!("{} · t50 / t95 (Δt95)", m.nombre()))).collect();
+        let filas_tabla: Vec<Vec<String>> = ens.iter().map(|e| {
+            std::iter::once(e.etiqueta()).chain(METODOS.iter().map(|m| {
+                filas.iter().find(|f| &f.perfil == perfil && f.metodo == *m && f.ensayo == *e).map(|f| format!("{} / {} ({})", fmtv(f.t50_min), fmtv(f.t95_min), fmtp(f.d_t95_pct))).unwrap_or_default()
+            })).collect()
+        }).collect();
+        let series: Vec<Serie> = METODOS.iter().map(|m| Serie {
+            nombre: m.nombre().to_string(),
+            puntos: ens.iter().enumerate().filter_map(|(i, e)| filas.iter().find(|f| &f.perfil == perfil && f.metodo == *m && f.ensayo == *e).and_then(|f| f.d_t95_pct).map(|y| ((i + 1) as f64, y))).collect(),
+            color: color_metodo(*m), grosor: 2.0, relleno: false, opaca: true,
+        }).collect();
+        let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+        for s in &series { for (_, y) in &s.puntos { lo = lo.min(*y); hi = hi.max(*y); } }
+        let pad = ((hi - lo) * 0.1).max(1.0);
+        let (lo, hi) = (lo - pad, hi + pad);
+        let leyenda: Vec<(String, u32)> = METODOS.iter().map(|m| (m.nombre().to_string(), color_metodo(*m))).collect();
+        let etiquetas = ens.iter().enumerate().map(|(i, e)| format!("{} {}", i + 1, e.etiqueta())).collect::<Vec<_>>().join(" · ");
+        let g = grafica(series, vec![], Ejes { x: (1.0, ens.len() as f64), y: (lo, hi), x_log: false, y_log: false, x_ticks: (1..=ens.len()).map(|i| i as f64).collect(), y_ticks: ticks_lineales(lo, hi, 5), x_titulo: etiquetas, y_titulo: "Cambio en t95 respecto a la referencia (%)".into() }, 280.0);
+        base
+            .child(tarjeta("Cambio en t95 por ensayo", leyenda, g))
+            .child(tarjeta("Tiempos por ensayo (min)", vec![], tabla_txt(&cab.iter().map(|s| s.as_str()).collect::<Vec<_>>(), filas_tabla)))
+            .into_any_element()
+    }
+
+    /// Pestaña Auditoría: resumen de D_L por escenario y los 12 valores mayores.
+    fn vista_auditoria(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let aud = analisis::auditoria(h, &self.criticas);
+        let n_mal = aud.iter().filter(|a| !a.d.is_finite()).count();
+        let res = analisis::resumen_auditoria(&aud);
+        let resumen = tabla_txt(&["Perfil", "Correlación", "D_L mín", "Mediana", "D_L máx", "Máx / mín"], res.iter().map(|r| vec![r.perfil.clone(), r.metodo.nombre().into(), format!("{:.1}", r.d_min), format!("{:.1}", r.d_mediana), format!("{:.1}", r.d_max), format!("{:.1}", r.ratio)]).collect());
+        let top = tabla_txt(&["Perfil", "Sección", "Correlación", "D_L (m²/s)", "B/H", "U/u*", "Crítica"], analisis::mayores(&aud, 12).iter().map(|a| vec![a.perfil.clone(), format!("{:.0}", a.seccion), a.metodo.nombre().into(), format!("{:.1}", a.d), format!("{:.1}", a.b_sobre_h), format!("{:.2}", a.u_sobre_ust), if a.critica { "sí".into() } else { String::new() }]).collect());
+        v_flex().id("aud").flex_1().h_full().min_w_0().overflow_y_scroll().gap_3().p_4()
+            .child(div().text_size(px(12.5)).text_color(rgb(MUTED)).child(format!("{} valores de D_L recalculados ({} no finitos). El detalle completo va en la exportación.", aud.len(), n_mal)))
+            .child(tarjeta("Resumen por caudal y correlación (m²/s)", vec![], resumen))
+            .child(tarjeta("Los 12 valores mayores", vec![], top))
     }
 
     /// Pestaña Datos: tabla de las secciones del perfil elegido y avisos de lectura.
@@ -927,38 +1055,53 @@ impl Riomat {
             .child(tarjeta("Avisos de los datos", vec![], avisos))
     }
 
-    /// Guarda las figuras actuales en una carpeta nueva (SVG, PNG a 300 ppp y PDF) sin bloquear la ventana.
-    fn exportar_figuras(&mut self, cx: &mut Context<Self>) {
-        let Some(figs) = self.figuras() else { return };
+    /// Exporta todo a una carpeta nueva: CSV, Excel, figuras (SVG, PNG y PDF) y el script de matplotlib. Corre en segundo plano.
+    fn exportar_todo(&mut self, cx: &mut Context<Self>) {
+        let (Some(figs), Some(h), Some(res)) = (self.figuras(), self.hid.clone(), self.actual().cloned()) else { return };
         if self.exportando {
             return;
         }
         self.exportando = true;
-        self.export_msg = Some("Exportando figuras…".into());
-        let base = Self::carpeta_export();
+        self.export_msg = Some("Exportando…".into());
+        let par = Parametros { duracion_pulso: self.durs[self.dur], campo_cada: Some(CAMPO_CADA), ..self.par.clone() };
+        let (perfil, metodo, archivos) = (h.perfiles[self.perfil].nombre.clone(), METODOS[self.metodo], self.archivos.clone());
+        let verif: Vec<exportar::Verificacion> = self
+            .avisos_lista()
+            .into_iter()
+            .map(|(n, c, m)| (match n { Nivel::Info => "info", Nivel::Aviso => "aviso", Nivel::Error => "error" }.to_string(), c.to_string(), m))
+            .collect();
+        let (kd, pa) = (self.leer_campo(&self.in_kd, "Factor de D_L", cx).unwrap_or(2.0), self.leer_campo(&self.in_pa, "Variación del área", cx).unwrap_or(10.0));
+        let criticas = self.criticas.clone();
         let marca = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let nombre_perfil = self.hid.as_ref().map(|h| h.perfiles[self.perfil].nombre.replace(' ', "")).unwrap_or_default();
-        let dir = base.join(format!("{nombre_perfil}-{marca}"));
+        let dir = Self::carpeta_export().join(format!("riomat-{marca}"));
         let tarea = cx.background_executor().spawn(async move {
+            let d = dir.clone();
             let r = std::panic::catch_unwind(move || -> Result<usize, String> {
-                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let esc = exportar::escenarios(&h, &par)?;
+                let m = exportar::Mostrado { perfil: &perfil, metodo, resultado: &res, archivos: &archivos };
+                let sens = analisis::sensibilidad(&h, &par, &analisis::ensayos(if kd > 1.0 { kd } else { 2.0 }, if pa > 0.0 && pa < 100.0 { pa } else { 10.0 }), &criticas)?;
+                let aud = analisis::auditoria(&h, &criticas);
+                let mut n = exportar::escribir(&d, &h, &par, &esc, &m, &verif, exportar::tablas_analisis(&sens, &aud))?.len();
+                let fdir = d.join("figuras");
+                std::fs::create_dir_all(&fdir).map_err(|e| format!("{}: {e}", fdir.display()))?;
                 for f in &figs {
                     let svg = a_svg(f, 720.0, 380.0);
-                    std::fs::write(dir.join(format!("{}.svg", f.nombre)), &svg).map_err(|e| e.to_string())?;
-                    std::fs::write(dir.join(format!("{}.png", f.nombre)), svg_a_png(&svg, 3.0)?).map_err(|e| e.to_string())?;
-                    std::fs::write(dir.join(format!("{}.pdf", f.nombre)), svg_a_pdf(&svg)?).map_err(|e| e.to_string())?;
+                    std::fs::write(fdir.join(format!("{}.svg", f.nombre)), &svg).map_err(|e| e.to_string())?;
+                    std::fs::write(fdir.join(format!("{}.png", f.nombre)), svg_a_png(&svg, 3.0)?).map_err(|e| e.to_string())?;
+                    std::fs::write(fdir.join(format!("{}.pdf", f.nombre)), svg_a_pdf(&svg)?).map_err(|e| e.to_string())?;
+                    n += 3;
                 }
-                Ok(figs.len())
+                Ok(n)
             })
-            .unwrap_or_else(|_| Err("fallo interno al generar las imágenes".into()));
-            (r, Self::carpeta_export())
+            .unwrap_or_else(|_| Err("fallo interno al exportar".into()));
+            (r, dir)
         });
         cx.spawn(async move |this, cx| {
-            let (r, raiz) = tarea.await;
+            let (r, dir) = tarea.await;
             let _ = this.update(cx, |this, cx| {
                 this.exportando = false;
                 this.export_msg = Some(match r {
-                    Ok(n) => format!("{n} figuras guardadas (SVG, PNG y PDF) en {}", raiz.display()),
+                    Ok(n) => format!("{n} archivos guardados en {}", dir.display()),
                     Err(e) => format!("No se pudo exportar: {e}"),
                 });
                 cx.notify();
