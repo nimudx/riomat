@@ -32,6 +32,9 @@ Los datos de referencia (Excel y CSV) **no se versionan**: carpeta `referencia/`
 Logo: R sólida cuya pierna fluye como un río y termina en una gota ámbar de trazador con ondas, sobre fondo de agua (`assets/logo.svg`). Reemplazó al logo anterior (perfil de río con punto), que no gustó.
 Iconos con `scripts/generar-iconos.sh`; instalación Linux con `scripts/install-linux.sh` (+ `packaging/linux/riomat.desktop`); Windows: icono incrustado por `build.rs` (winresource) e instalador Inno Setup (`packaging/windows/riomat.iss`), ambos **sin probar en Windows**.
 
+## Básicos de uso
+«Nuevo» (vuelve al inicio y restablece), aviso si hay resultados sin exportar antes de reemplazar datos, archivos recientes y ajustes (`~/.config/riomat/`, o `%APPDATA%\riomat`), «Acerca de», menú de avatar (arriba a la derecha) con Nuevo/Abrir/Pegar/Exportar/Ajustes (carpeta de exportación configurable) y atajos Ctrl+N/O/V/E. Sin probar con clics ni en Windows.
+
 ## Decisiones de diseño
 Tema claro piedra/agua; el trazador es el único color cálido; perfil longitudinal real del río con agua teñida por la concentración.
 Poco texto en pantalla: la verificación vive en una insignia (✓ / ⚠ N) que abre un panel. Identidad propia, no copia de R-THYM.

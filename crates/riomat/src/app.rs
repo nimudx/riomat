@@ -20,6 +20,69 @@ const VELOCIDADES: [usize; 4] = [1, 2, 4, 8];
 const CAMPO_CADA: usize = 8; // un cuadro cada 240 s
 const SEGMENTOS: usize = 60;
 
+actions!(riomat, [NuevoDatos, AbrirArchivo, PegarTabla, ExportarTodo]);
+
+/// Atajos de teclado (Ctrl en Linux y Windows, Cmd en macOS).
+pub fn registrar_atajos(cx: &mut App) {
+    let m = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+    let k = |tecla: &str| -> &'static str { Box::leak(format!("{m}-{tecla}").into_boxed_str()) };
+    cx.bind_keys([
+        KeyBinding::new(k("n"), NuevoDatos, Some("Riomat")),
+        KeyBinding::new(k("o"), AbrirArchivo, Some("Riomat")),
+        KeyBinding::new(k("v"), PegarTabla, Some("Riomat")),
+        KeyBinding::new(k("e"), ExportarTodo, Some("Riomat")),
+    ]);
+}
+
+/// Acción que pide confirmación si hay resultados sin exportar.
+#[derive(Clone)]
+enum Accion {
+    Nuevo,
+    Abrir,
+    Pegar,
+    Reciente(Vec<PathBuf>),
+}
+
+/// Carpeta de configuración del usuario (para la lista de archivos recientes).
+fn carpeta_config() -> PathBuf {
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(d).join("riomat");
+    }
+    if let Some(d) = std::env::var_os("APPDATA") {
+        return PathBuf::from(d).join("riomat");
+    }
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".config").join("riomat")
+}
+
+/// Ajustes del usuario: archivo `ajustes.txt` con líneas `clave=valor`.
+fn leer_ajuste(clave: &str) -> Option<String> {
+    let t = std::fs::read_to_string(carpeta_config().join("ajustes.txt")).ok()?;
+    t.lines().find_map(|l| l.strip_prefix(&format!("{clave}=")).map(|v| v.trim().to_string())).filter(|v| !v.is_empty())
+}
+
+fn guardar_ajuste(clave: &str, valor: Option<&str>) {
+    let dir = carpeta_config();
+    let ruta = dir.join("ajustes.txt");
+    let previo = std::fs::read_to_string(&ruta).unwrap_or_default();
+    let mut lineas: Vec<String> = previo.lines().filter(|l| !l.starts_with(&format!("{clave}="))).map(String::from).collect();
+    if let Some(v) = valor {
+        lineas.push(format!("{clave}={v}"));
+    }
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(ruta, lineas.join("\n"));
+    }
+}
+
+fn leer_recientes() -> Vec<Vec<PathBuf>> {
+    std::fs::read_to_string(carpeta_config().join("recientes.txt"))
+        .map(|t| t.lines().map(|l| l.split('\t').map(PathBuf::from).filter(|p| p.exists()).collect::<Vec<_>>()).filter(|v| !v.is_empty()).take(5).collect())
+        .unwrap_or_default()
+}
+
+fn nombre_reciente(v: &[PathBuf]) -> String {
+    v.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect::<Vec<_>>().join(" + ")
+}
+
 fn color_metodo(m: Metodo) -> u32 {
     match m {
         Metodo::Fischer => C_FISCHER,
@@ -78,6 +141,13 @@ pub struct Riomat {
     fig_sel: usize,
     ver_avisos: bool,
     ancho: f32,
+    sin_exportar: bool,
+    confirmar: Option<Accion>,
+    acerca: bool,
+    menu: bool,
+    ajustes: bool,
+    recientes: Vec<Vec<PathBuf>>,
+    foco: FocusHandle,
     comp: Option<Comparacion>,
     sens: Option<Vec<analisis::FilaSens>>,
     sens_error: Option<String>,
@@ -106,7 +176,7 @@ impl Riomat {
         );
         let in_kd = campo("2".into(), "×", window, cx);
         let in_pa = campo("10".into(), "%", window, cx);
-        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, ancho: 1400.0, comp: None, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, ancho: 1400.0, sin_exportar: false, confirmar: None, acerca: false, menu: false, ajustes: false, recientes: leer_recientes(), foco: cx.focus_handle(), comp: None, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
         let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
         if !rutas.is_empty() {
             s.cargar(&rutas);
@@ -133,16 +203,81 @@ impl Riomat {
             1 => leer_tabla_archivo(&r[0]),
             _ => leer_hidraulica_auto(&r[0], &r[1]),
         };
+        let ok = res.is_ok();
         self.aplicar(res, nombres.into_iter().take(2).collect());
+        if ok {
+            self.registrar_reciente(r.into_iter().take(2).collect());
+        }
+    }
+
+    fn registrar_reciente(&mut self, rutas: Vec<PathBuf>) {
+        let rutas: Vec<PathBuf> = rutas.into_iter().map(|p| p.canonicalize().unwrap_or(p)).collect();
+        self.recientes.retain(|v| *v != rutas);
+        self.recientes.insert(0, rutas);
+        self.recientes.truncate(5);
+        let texto = self.recientes.iter().map(|v| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\t")).collect::<Vec<_>>().join("\n");
+        let dir = carpeta_config();
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join("recientes.txt"), texto);
+        }
+    }
+
+    /// Ejecuta la acción o, si hay resultados sin exportar, pide confirmación primero.
+    fn pedir(&mut self, a: Accion, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hid.is_some() && self.sin_exportar && !matches!(a, Accion::Nuevo if self.hid.is_none()) {
+            self.confirmar = Some(a);
+            cx.notify();
+        } else {
+            self.ejecutar(a, window, cx);
+        }
+    }
+
+    fn ejecutar(&mut self, a: Accion, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirmar = None;
+        match a {
+            Accion::Nuevo => self.nuevo(window, cx),
+            Accion::Abrir => self.abrir_dialogo(cx),
+            Accion::Pegar => self.pegar(cx),
+            Accion::Reciente(v) => {
+                self.cargar(&v);
+                self.frame = self.frame_inicial();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Cierra los datos y resultados actuales y vuelve a la pantalla de inicio con los parámetros por defecto.
+    fn nuevo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.playing = false;
+        self.generacion += 1;
+        self.restablecer(window, cx);
+        self.hid = None;
+        self.vista = None;
+        self.comp = None;
+        self.sens = None;
+        self.sens_error = None;
+        self.archivos.clear();
+        self.error = None;
+        self.export_msg = None;
+        self.criticas.clear();
+        self.sin_exportar = false;
+        self.ver_avisos = false;
+        self.pestana = Pestana::Simulacion;
+        self.perfil = 1;
+        self.metodo = 1;
+        self.frame = 4;
+        cx.notify();
     }
 
     fn aplicar(&mut self, res: Result<Hidraulica, String>, archivos: Vec<String>) {
         self.sens = None;
+        self.comp = None;
         match res {
             Ok(h) => {
                 self.archivos = archivos;
                 self.perfil = self.perfil.min(h.perfiles.len().saturating_sub(1));
                 self.criticas = analisis::criticas_por_defecto(&h);
+                self.sin_exportar = true;
                 self.hid = Some(h);
                 self.error = None;
                 self.recalcular();
@@ -458,6 +593,16 @@ impl Render for Riomat {
         self.ancho = f32::from(window.viewport_size().width);
         let raiz = v_flex()
             .id("raiz")
+            .key_context("Riomat")
+            .track_focus(&self.foco)
+            .on_action(cx.listener(|this, _: &NuevoDatos, window, cx| this.pedir(Accion::Nuevo, window, cx)))
+            .on_action(cx.listener(|this, _: &AbrirArchivo, window, cx| this.pedir(Accion::Abrir, window, cx)))
+            .on_action(cx.listener(|this, _: &PegarTabla, window, cx| this.pedir(Accion::Pegar, window, cx)))
+            .on_action(cx.listener(|this, _: &ExportarTodo, _, cx| {
+                if this.hid.is_some() && !this.exportando {
+                    this.exportar_todo(cx);
+                }
+            }))
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
@@ -465,8 +610,21 @@ impl Render for Riomat {
                 this.cargar(p.paths());
                 cx.notify();
             }));
+        if !self.foco.contains_focused(window, cx) && !self.acerca && self.confirmar.is_none() {
+            window.focus(&self.foco, cx);
+        }
+        let menu = (self.menu && self.hid.is_some() && self.vista.is_some()).then(|| self.menu_perfil(cx));
+        let capa = if let Some(a) = self.confirmar.clone() {
+            Some(self.dialogo_confirmar(a, cx).into_any_element())
+        } else if self.ajustes {
+            Some(self.dialogo_ajustes(cx).into_any_element())
+        } else if self.acerca {
+            Some(self.dialogo_acerca(cx).into_any_element())
+        } else {
+            None
+        };
         if self.hid.is_none() || self.vista.is_none() {
-            return raiz.child(self.vacio(cx));
+            return raiz.child(self.vacio(cx)).children(capa);
         }
         if self.pestana == Pestana::Comparar && self.comp.is_none() {
             self.calcular_comp();
@@ -481,7 +639,7 @@ impl Render for Riomat {
         };
         let cuerpo = h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(centro);
         let cuerpo = if self.ver_avisos { cuerpo.child(self.panel_der(cx)) } else { cuerpo };
-        raiz.child(self.barra_superior(cx)).child(cuerpo)
+        raiz.child(self.barra_superior(cx)).child(cuerpo).children(menu).children(capa)
     }
 }
 
@@ -502,14 +660,140 @@ impl Riomat {
                     .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("También funcionan los dos Excel anteriores: arrástralos juntos.")),
             )
             .children(self.error.clone().map(|e| div().max_w(px(560.)).text_color(rgb(ERR)).child(e)))
+            .children((!self.recientes.is_empty()).then(|| {
+                v_flex().gap_1().items_center()
+                    .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child("Recientes"))
+                    .children(self.recientes.iter().enumerate().map(|(i, v)| {
+                        let v2 = v.clone();
+                        div().id(("rec", i)).cursor_pointer().text_size(px(12.5)).text_color(rgb(ACCENT)).child(nombre_reciente(v))
+                            .on_click(cx.listener(move |this, _, window, cx| this.pedir(Accion::Reciente(v2.clone()), window, cx)))
+                    }))
+            }))
             .child(h_flex().gap_2()
-                .child(boton("abrir", "Abrir archivo…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx))))
-                .child(boton("pegar", "Pegar tabla de HEC-RAS", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))
+                .child(boton("abrir", "Abrir archivo…", ACCENT).on_click(cx.listener(|this, _, window, cx| this.pedir(Accion::Abrir, window, cx))))
+                .child(boton("pegar", "Pegar tabla de HEC-RAS", RESET).on_click(cx.listener(|this, _, window, cx| this.pedir(Accion::Pegar, window, cx))))
                 .child(boton("ejemplo", "Cargar datos de ejemplo", RESET).on_click(cx.listener(|this, _, _, cx| {
                     let v = Riomat::buscar_por_defecto();
                     this.cargar(&v);
                     cx.notify();
-                }))))
+                })))
+                .child(boton("acerca0", "Acerca de", RESET).on_click(cx.listener(|this, _, _, cx| { this.acerca = true; cx.notify(); }))))
+    }
+
+    fn capa(&self, contenido: impl IntoElement) -> Div {
+        div().absolute().top_0().left_0().size_full().bg(gpui::rgba(0x00000066)).flex().items_center().justify_center()
+            .child(v_flex().gap_3().p_5().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).child(contenido))
+    }
+
+    /// Menú del avatar (arriba a la derecha): datos, exportación, avisos y «Acerca de».
+    fn menu_perfil(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let item = |id: &'static str, icono: &'static str, texto: &'static str, atajo: &'static str| {
+            h_flex().id(id).gap_2().h(px(32.)).px_2().items_center().rounded_md().cursor_pointer().hover(|s| s.bg(rgb(0xe3eef5)))
+                .text_size(px(13.))
+                .child(div().w(px(18.)).flex_none().text_color(rgb(MUTED)).child(icono))
+                .child(div().flex_1().child(texto))
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(atajo))
+        };
+        let sep = || div().h(px(1.)).my_1().bg(rgb(BORDER));
+        let tarjeta = v_flex().w(px(260.)).p_2().gap_0p5().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).shadow_lg()
+            .child(
+                h_flex().gap_3().items_center().p_2()
+                    .child(div().size(px(40.)).flex_none().flex().items_center().justify_center().rounded_full().bg(rgb(ACCENT)).text_color(rgb(0xffffff)).font_weight(FontWeight::SEMIBOLD).child("AR"))
+                    .child(v_flex().child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("Andrea Riveros")).child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child("colab. nimudx"))),
+            )
+            .child(sep())
+            .child(item("m_nuevo", "＋", "Nuevo", "Ctrl+N").on_click(cx.listener(|this, _, window, cx| { this.menu = false; this.pedir(Accion::Nuevo, window, cx); })))
+            .child(item("m_abrir", "⌕", "Abrir archivo…", "Ctrl+O").on_click(cx.listener(|this, _, window, cx| { this.menu = false; this.pedir(Accion::Abrir, window, cx); })))
+            .child(item("m_pegar", "⎘", "Pegar tabla", "Ctrl+V").on_click(cx.listener(|this, _, window, cx| { this.menu = false; this.pedir(Accion::Pegar, window, cx); })))
+            .child(sep())
+            .child(item("m_exp", "⇩", "Exportar todo", "Ctrl+E").on_click(cx.listener(|this, _, _, cx| { this.menu = false; if !this.exportando { this.exportar_todo(cx); } cx.notify(); })))
+            .child(item("m_carp", "▤", "Abrir carpeta de exportación", "").on_click(cx.listener(|this, _, _, cx| { this.menu = false; Riomat::abrir_carpeta_export(); cx.notify(); })))
+            .child(item("m_ajustes", "⚙", "Ajustes…", "").on_click(cx.listener(|this, _, _, cx| { this.menu = false; this.ajustes = true; cx.notify(); })))
+            .child(item("m_av", "⚠", if self.ver_avisos { "Ocultar verificación" } else { "Ver verificación" }, "").on_click(cx.listener(|this, _, _, cx| { this.menu = false; this.ver_avisos = !this.ver_avisos; cx.notify(); })))
+            .child(sep())
+            .child(item("m_acerca", "ⓘ", "Acerca de Riomat", "").on_click(cx.listener(|this, _, _, cx| { this.menu = false; this.acerca = true; cx.notify(); })));
+        div().id("menu_fondo").absolute().top_0().left_0().size_full().flex().justify_end().items_start().pt(px(52.)).pr(px(12.))
+            .on_click(cx.listener(|this, _, _, cx| { this.menu = false; cx.notify(); }))
+            .child(tarjeta)
+    }
+
+    fn abrir_carpeta_export() {
+        let dir = Riomat::carpeta_export();
+        let _ = std::fs::create_dir_all(&dir);
+        let programa = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = std::process::Command::new(programa).arg(&dir).spawn();
+    }
+
+    fn elegir_carpeta_export(&mut self, cx: &mut Context<Self>) {
+        let tarea = cx.background_executor().spawn(async move {
+            rfd::AsyncFileDialog::new().set_title("Carpeta donde guardar las exportaciones").pick_folder().await.map(|f| f.path().to_path_buf())
+        });
+        cx.spawn(async move |this, cx| {
+            if let Some(dir) = tarea.await {
+                let _ = this.update(cx, |this, cx| {
+                    guardar_ajuste("export", Some(&dir.to_string_lossy()));
+                    cx.notify();
+                    let _ = this;
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn dialogo_ajustes(&self, cx: &mut Context<Self>) -> Div {
+        let dir = Riomat::carpeta_export();
+        let personalizada = leer_ajuste("export").is_some();
+        self.capa(
+            v_flex().gap_3().w(px(420.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Ajustes"))
+                .child(v_flex().gap_1()
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("Carpeta de exportación"))
+                    .child(div().text_size(px(12.5)).p_2().rounded_md().bg(rgb(BG)).border_1().border_color(rgb(BORDER)).child(dir.to_string_lossy().into_owned()))
+                    .child(h_flex().gap_2()
+                        .child(boton("aj_cambiar", "Cambiar…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.elegir_carpeta_export(cx))))
+                        .children(personalizada.then(|| boton("aj_defecto", "Restaurar", RESET).on_click(cx.listener(|_, _, _, cx| { guardar_ajuste("export", None); cx.notify(); }))))))
+                .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child(format!("Los ajustes se guardan en {}", carpeta_config().join("ajustes.txt").display())))
+                .child(boton("aj_ok", "Cerrar", ACCENT).on_click(cx.listener(|this, _, _, cx| { this.ajustes = false; cx.notify(); }))),
+        )
+    }
+
+    fn dialogo_confirmar(&self, a: Accion, cx: &mut Context<Self>) -> Div {
+        let a2 = a.clone();
+        self.capa(
+            v_flex().gap_3()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Hay resultados sin exportar"))
+                .child(div().text_size(px(12.5)).text_color(rgb(MUTED)).child("Si continúas se descartan los resultados actuales. Puedes exportarlos antes con «Exportar todo»."))
+                .child(h_flex().gap_2()
+                    .child(boton("conf_si", "Continuar", ACCENT).on_click(cx.listener(move |this, _, window, cx| this.ejecutar(a2.clone(), window, cx))))
+                    .child(boton("conf_no", "Cancelar", RESET).on_click(cx.listener(|this, _, _, cx| { this.confirmar = None; cx.notify(); })))),
+        )
+    }
+
+    fn dialogo_acerca(&self, cx: &mut Context<Self>) -> Div {
+        let fila = |k: &'static str, v: String| h_flex().gap_2().text_size(px(12.)).child(div().w(px(84.)).flex_none().text_color(rgb(MUTED)).child(k)).child(div().child(v));
+        let sistema = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
+        self.capa(
+            v_flex().gap_3().w(px(400.))
+                .child(h_flex().gap_3().items_center()
+                    .child(logo_tam(56.))
+                    .child(v_flex()
+                        .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child("riomat"))
+                        .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("versión {}", env!("CARGO_PKG_VERSION"))))))
+                .child(div().text_size(px(12.5)).text_color(rgb(MUTED)).child("Transporte 1D de un trazador pasivo en ríos, directo desde los resultados de HEC-RAS."))
+                .child(div().h(px(1.)).bg(rgb(BORDER)))
+                .child(v_flex().gap_1()
+                    .child(fila("Autoría", "Andrea Riveros".into()))
+                    .child(fila("Colaboración", "nimudx".into()))
+                    .child(fila("Caso", "Río Mantaro · Puente Breña (2524 m)".into()))
+                    .child(fila("Modelo", "volúmenes finitos implícitos, 3 correlaciones de D_L".into()))
+                    .child(fila("Licencia", "MIT".into()))
+                    .child(fila("Sistema", sistema))
+                    .child(fila("Código", "github.com/nimudx/riomat".into())))
+                .child(div().h(px(1.)).bg(rgb(BORDER)))
+                .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child("Alcance: trazador pasivo; D_L sin calibrar; pulso de entrada hipotético (T = 300 s)."))
+                .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child("Atajos: Ctrl+N nuevo · Ctrl+O abrir · Ctrl+V pegar · Ctrl+E exportar todo"))
+                .child(boton("acerca_ok", "Cerrar", ACCENT).on_click(cx.listener(|this, _, _, cx| { this.acerca = false; cx.notify(); }))),
+        )
     }
 
     fn barra_superior(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -544,7 +828,12 @@ impl Riomat {
             .border_color(rgb(if n_av == 0 { OK } else { WARN }))
             .text_size(px(12.))
             .text_color(rgb(if n_av == 0 { OK } else { WARN }))
-            .child(if n_av == 0 { "✓ Verificado".to_string() } else { format!("⚠ {n_av} avisos") })
+            .child(match (n_av == 0, self.ancho >= 1120.0) {
+                (true, true) => "✓ Verificado".to_string(),
+                (true, false) => "✓".to_string(),
+                (false, true) => format!("⚠ {n_av} avisos"),
+                (false, false) => format!("⚠ {n_av}"),
+            })
             .on_click(cx.listener(|this, _, _, cx| {
                 this.ver_avisos = !this.ver_avisos;
                 cx.notify();
@@ -573,12 +862,18 @@ impl Riomat {
             .bg(rgb(PANEL))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(h_flex().gap_2().items_center().child(logo()).child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("riomat")))
+            .child(h_flex().gap_2().items_center().child(logo()).children((self.ancho >= 1000.0).then(|| div().text_size(px(17.)).font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("riomat"))))
             .child(div().w(px(1.)).h(px(20.)).bg(rgb(BORDER)))
             .child(pestanas)
             .child(div().flex_1())
-            .children(simulando.then(|| h_flex().gap_2().items_center().child(reproducir).child(reiniciar).children((self.ancho >= 1030.0).then(|| pastilla(format!("{t_min:.0} / {total:.0} min")))).children((self.ancho >= 1200.0).then(|| vel))))
+            .children(simulando.then(|| h_flex().gap_2().items_center().child(reproducir).children((self.ancho >= 1000.0).then(|| reiniciar)).children((self.ancho >= 1030.0).then(|| pastilla(format!("{t_min:.0} / {total:.0} min")))).children((self.ancho >= 1200.0).then(|| vel))))
             .child(insignia)
+            .child(
+                div().id("avatar").size(px(32.)).flex_none().flex().items_center().justify_center().rounded_full().cursor_pointer()
+                    .bg(rgb(ACCENT)).text_color(rgb(0xffffff)).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("AR")
+                    .border_2().border_color(if self.menu { rgb(0xa6d6dc) } else { rgb(PANEL) })
+                    .on_click(cx.listener(|this, _, _, cx| { this.menu = !this.menu; cx.notify(); })),
+            )
     }
 
     fn panel_izq(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -618,7 +913,7 @@ impl Riomat {
             .bg(rgb(PANEL))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .child(v_flex().gap_2().child(seccion("Datos")).children(self.archivos.iter().map(|a| div().text_size(px(11.5)).text_color(rgb(MUTED)).truncate().child(a.clone()))).child(h_flex().gap_2().child(boton("abrir2", "Abrir…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx)))).child(boton("pegar2", "Pegar", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))))
+            .child(v_flex().gap_2().child(seccion("Datos")).children(self.archivos.iter().map(|a| div().text_size(px(11.5)).text_color(rgb(MUTED)).truncate().child(a.clone()))).child(h_flex().gap_2().flex_wrap().child(boton("abrir2", "Abrir…", ACCENT).on_click(cx.listener(|this, _, window, cx| this.pedir(Accion::Abrir, window, cx)))).child(boton("pegar2", "Pegar", RESET).on_click(cx.listener(|this, _, window, cx| this.pedir(Accion::Pegar, window, cx)))).child(boton("nuevo", "Nuevo", RESET).on_click(cx.listener(|this, _, window, cx| this.pedir(Accion::Nuevo, window, cx))))))
             .child(v_flex().gap_2().child(seccion("Caudal")).child(perfiles))
             .child(v_flex().gap_2().child(seccion("Correlación D_L")).child(metodos))
             .child(
@@ -927,6 +1222,9 @@ impl Riomat {
     }
 
     fn carpeta_export() -> PathBuf {
+        if let Some(p) = leer_ajuste("export") {
+            return PathBuf::from(p);
+        }
         let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         base.join("Documents").join("riomat-export")
     }
@@ -1422,6 +1720,7 @@ impl Riomat {
             let (r, dir) = tarea.await;
             let _ = this.update(cx, |this, cx| {
                 this.exportando = false;
+                this.sin_exportar = this.sin_exportar && r.is_err();
                 this.export_msg = Some(match r {
                     Ok(n) => format!("{n} archivos guardados en {}", dir.display()),
                     Err(e) => format!("No se pudo exportar: {e}"),

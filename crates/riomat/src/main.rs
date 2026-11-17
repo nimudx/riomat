@@ -11,6 +11,7 @@ use gpui_kit::*;
 fn main() {
     let args: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
     gpui_kit::application().run(move |cx| {
+        app::registrar_atajos(cx);
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Light, None, cx);
         // La ventana se adapta a la pantalla (en Windows con escala del 125-150 % el espacio lógico es menor).
