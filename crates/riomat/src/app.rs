@@ -14,6 +14,8 @@ use gpui_kit::*;
 
 use crate::plot::*;
 use crate::theme::*;
+use crate::theme::px;
+use gpui_kit::px as rpx;
 
 const DURACIONES_BASE: [f64; 4] = [30.0, 300.0, 900.0, 1800.0];
 const VELOCIDADES: [usize; 4] = [1, 2, 4, 8];
@@ -590,7 +592,7 @@ fn pastilla(texto: String) -> Div {
 
 impl Render for Riomat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ancho = f32::from(window.viewport_size().width);
+        self.ancho = f32::from(window.viewport_size().width) / ESCALA;
         let raiz = v_flex()
             .id("raiz")
             .key_context("Riomat")
@@ -978,8 +980,8 @@ impl Riomat {
             |_, _, _| (),
             move |b, _, window, _| {
                 let (w, hh) = (f32::from(b.size.width), f32::from(b.size.height));
-                let pos = |x: f64, e: f64| point(b.origin.x + px((x / xmax) as f32 * w), b.origin.y + px((1.0 - ((e - lo) / (hi - lo)) as f32) * hh));
-                let fondo = |x: f64| point(b.origin.x + px((x / xmax) as f32 * w), b.origin.y + px(hh));
+                let pos = |x: f64, e: f64| point(b.origin.x + rpx((x / xmax) as f32 * w), b.origin.y + rpx((1.0 - ((e - lo) / (hi - lo)) as f32) * hh));
+                let fondo = |x: f64| point(b.origin.x + rpx((x / xmax) as f32 * w), b.origin.y + rpx(hh));
                 // Roca
                 let mut pb = PathBuilder::fill();
                 pb.move_to(fondo(0.0));

@@ -29,6 +29,7 @@ fn main() {
             ..Default::default()
         };
         gpui_kit::open_window(options, cx, move |window, cx| {
+            window.set_rem_size(px(16.0 * theme::ESCALA));
             let view = cx.new(|cx| app::Riomat::new(args, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         })

@@ -3,6 +3,8 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::theme::*;
+use crate::theme::px;
+use gpui_kit::px as rpx;
 
 pub use riomat_plot::{Ejes, Marca, Serie, num, techo_bonito, ticks_lineales, tr};
 
@@ -17,15 +19,15 @@ pub fn grafica(series: Vec<Serie>, marcas: Vec<Marca>, ejes: Ejes, alto: f32) ->
         move |b, _, window, _| {
             let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
             let pos = |x: f64, y: f64| {
-                point(b.origin.x + px((tr(x, xr, xl).clamp(-0.05, 1.05) as f32) * w), b.origin.y + px((1.0 - tr(y, yr, yl).clamp(-0.05, 1.05) as f32) * h))
+                point(b.origin.x + rpx((tr(x, xr, xl).clamp(-0.05, 1.05) as f32) * w), b.origin.y + rpx((1.0 - tr(y, yr, yl).clamp(-0.05, 1.05) as f32) * h))
             };
             for &y in &yticks {
                 let p = pos(xr.0, y);
-                window.paint_quad(fill(Bounds::new(point(b.origin.x, p.y), size(px(w), px(1.))), rgba((GRID << 8) | 0xff)));
+                window.paint_quad(fill(Bounds::new(point(b.origin.x, p.y), size(rpx(w), rpx(1.))), rgba((GRID << 8) | 0xff)));
             }
             for &x in &xticks {
                 let p = pos(x, yr.0);
-                window.paint_quad(fill(Bounds::new(point(p.x, b.origin.y), size(px(1.), px(h))), rgba((GRID << 8) | 0xff)));
+                window.paint_quad(fill(Bounds::new(point(p.x, b.origin.y), size(rpx(1.), rpx(h))), rgba((GRID << 8) | 0xff)));
             }
             for s in &series {
                 if s.puntos.len() < 2 {
@@ -101,8 +103,8 @@ pub fn mapa_calor(f: riomat_plot::Figura, alto: f32) -> impl IntoElement {
                 for i in 0..nx {
                     let c = colores[j * nx + i];
                     // fila 0 = valor menor de Y, abajo; se solapa 0.5 px para evitar costuras
-                    let o = point(b.origin.x + px(i as f32 * cw), b.origin.y + px(h - (j + 1) as f32 * ch));
-                    window.paint_quad(fill(Bounds::new(o, size(px(cw + 0.5), px(ch + 0.5))), rgb(c)));
+                    let o = point(b.origin.x + rpx(i as f32 * cw), b.origin.y + rpx(h - (j + 1) as f32 * ch));
+                    window.paint_quad(fill(Bounds::new(o, size(rpx(cw + 0.5), rpx(ch + 0.5))), rgb(c)));
                 }
             }
         },
@@ -116,8 +118,8 @@ pub fn mapa_calor(f: riomat_plot::Figura, alto: f32) -> impl IntoElement {
             let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
             let ch = h / nb as f32;
             for (k, c) in barra.iter().enumerate() {
-                let o = point(b.origin.x, b.origin.y + px(h - (k + 1) as f32 * ch));
-                window.paint_quad(fill(Bounds::new(o, size(px(w), px(ch + 0.5))), rgb(*c)));
+                let o = point(b.origin.x, b.origin.y + rpx(h - (k + 1) as f32 * ch));
+                window.paint_quad(fill(Bounds::new(o, size(rpx(w), rpx(ch + 0.5))), rgb(*c)));
             }
         },
     )

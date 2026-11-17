@@ -29,3 +29,11 @@ pub const TRAZ_ALTO: u32 = 0xc2411b;
 pub const C_FISCHER: u32 = 0x0072b2;
 pub const C_SEO: u32 = 0xd55e00;
 pub const C_KF: u32 = 0x009e73;
+
+/// Escala global de la interfaz. En Windows los elementos se ven demasiado grandes con el mismo diseño, así que se reduce.
+pub const ESCALA: f32 = if cfg!(target_os = "windows") { 0.8 } else { 1.0 };
+
+/// `px` con la escala global aplicada: todas las medidas de la interfaz pasan por aquí.
+pub fn px(v: f32) -> gpui_kit::Pixels {
+    gpui_kit::px(v * ESCALA)
+}
