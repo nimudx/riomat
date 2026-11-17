@@ -1,0 +1,928 @@
+//! Estado y pantalla principal de Riomat (tema claro, esquema vivo del tramo + gráficas + telemetría).
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use riomat_core::solver::interp;
+use riomat_plot::{Figura, a_svg, svg_a_pdf, svg_a_png};
+use riomat_core::*;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::*;
+
+use crate::plot::*;
+use crate::theme::*;
+
+const DURACIONES_BASE: [f64; 4] = [30.0, 300.0, 900.0, 1800.0];
+const VELOCIDADES: [usize; 4] = [1, 2, 4, 8];
+const CAMPO_CADA: usize = 8; // un cuadro cada 240 s
+const SEGMENTOS: usize = 60;
+
+fn color_metodo(m: Metodo) -> u32 {
+    match m {
+        Metodo::Fischer => C_FISCHER,
+        Metodo::SeoCheong => C_SEO,
+        Metodo::KashefipourFalconer => C_KF,
+    }
+}
+
+/// Rampa del trazador: agua clara → ámbar → bermellón (como tinta en el agua).
+fn rampa(t: f64) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let (a, b, u) = if t < 0.5 { (AGUA, TRAZ_MEDIO, t * 2.0) } else { (TRAZ_MEDIO, TRAZ_ALTO, (t - 0.5) * 2.0) };
+    let m = |s: u32| {
+        let (x, y) = (((a >> s) & 0xff) as f64, ((b >> s) & 0xff) as f64);
+        ((x + (y - x) * u).round() as u32) << s
+    };
+    m(16) | m(8) | m(0)
+}
+
+struct Vista {
+    sims: HashMap<(usize, usize), Resultado>,
+    d: Vec<Vec<f64>>,
+}
+
+pub struct Riomat {
+    hid: Option<Hidraulica>,
+    archivos: Vec<String>,
+    error: Option<String>,
+    perfil: usize,
+    metodo: usize,
+    dur: usize,
+    vel: usize,
+    frame: usize,
+    playing: bool,
+    generacion: u64,
+    vista: Option<Vista>,
+    export_msg: Option<String>,
+    exportando: bool,
+    durs: Vec<f64>,
+    par: Parametros,
+    in_masa: Entity<InputState>,
+    in_dur: Entity<InputState>,
+    in_dx: Entity<InputState>,
+    in_dt: Entity<InputState>,
+    in_tf: Entity<InputState>,
+}
+
+impl Riomat {
+    pub fn new(args: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let par = Parametros::default();
+        let campo = |valor: String, ayuda: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).placeholder(ayuda).default_value(valor));
+        let (in_masa, in_dur, in_dx, in_dt, in_tf) = (
+            campo(texto_num(par.masa), "masa", window, cx),
+            campo(texto_num(par.duracion_pulso), "s", window, cx),
+            campo(texto_num(par.dx_max), "m", window, cx),
+            campo(texto_num(par.dt), "s", window, cx),
+            campo(texto_num(par.t_final / 60.0), "min", window, cx),
+        );
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
+        if !rutas.is_empty() {
+            s.cargar(&rutas);
+        }
+        s
+    }
+
+    fn buscar_por_defecto() -> Vec<PathBuf> {
+        let cand = [PathBuf::from("referencia"), PathBuf::from("."), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../referencia")];
+        for c in cand {
+            let v = excels_en(&c);
+            if v.len() >= 2 {
+                return v;
+            }
+        }
+        vec![]
+    }
+
+    fn cargar(&mut self, rutas: &[PathBuf]) {
+        let r = if rutas.len() == 1 && rutas[0].is_dir() { excels_en(&rutas[0]) } else { rutas.to_vec() };
+        let nombres: Vec<String> = r.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        let res = match r.len() {
+            0 => Err("No hay archivos.".to_string()),
+            1 => leer_tabla_archivo(&r[0]),
+            _ => leer_hidraulica_auto(&r[0], &r[1]),
+        };
+        self.aplicar(res, nombres.into_iter().take(2).collect());
+    }
+
+    fn aplicar(&mut self, res: Result<Hidraulica, String>, archivos: Vec<String>) {
+        match res {
+            Ok(h) => {
+                self.archivos = archivos;
+                self.perfil = self.perfil.min(h.perfiles.len().saturating_sub(1));
+                self.hid = Some(h);
+                self.error = None;
+                self.recalcular();
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Pega una tabla de resultados por perfil copiada desde HEC-RAS.
+    fn pegar(&mut self, cx: &mut Context<Self>) {
+        let texto = cx.read_from_clipboard().and_then(|i| i.text());
+        match texto {
+            Some(t) => {
+                let res = leer_tabla_texto(&t);
+                self.aplicar(res, vec!["Tabla pegada del portapapeles".into()]);
+            }
+            None => self.error = Some("El portapapeles no tiene texto. Copia la tabla de perfiles en HEC-RAS y vuelve a intentar.".into()),
+        }
+        cx.notify();
+    }
+
+    fn recalcular(&mut self) {
+        let Some(h) = &self.hid else { return };
+        let p = &h.perfiles[self.perfil];
+        let mut sims = HashMap::new();
+        let mut d = Vec::new();
+        for (mi, m) in METODOS.iter().enumerate() {
+            let dl = coeficientes(*m, &p.u, &p.a, &p.b, &p.r, &p.sf);
+            for (di, dur) in self.durs.iter().enumerate() {
+                let par = Parametros { duracion_pulso: *dur, campo_cada: Some(CAMPO_CADA), ..self.par.clone() };
+                match simular_entrada(p.q, &p.x, &p.a, &dl, &par) {
+                    Ok(r) => {
+                        sims.insert((mi, di), r);
+                    }
+                    Err(e) => self.error = Some(format!("{} / {}: {e}", p.nombre, m.nombre())),
+                }
+            }
+            d.push(dl);
+        }
+        self.vista = Some(Vista { sims, d });
+        self.frame = self.frame.min(self.n_frames().saturating_sub(1));
+    }
+
+    fn actual(&self) -> Option<&Resultado> {
+        self.vista.as_ref()?.sims.get(&(self.metodo, self.dur))
+    }
+
+    fn n_frames(&self) -> usize {
+        self.actual().map(|r| r.campo.len()).unwrap_or(1)
+    }
+
+    fn leer_campo(&self, estado: &Entity<InputState>, nombre: &str, cx: &App) -> Result<f64, String> {
+        let t = estado.read(cx).value().to_string();
+        riomat_core::tabla::numero(&t).ok_or_else(|| format!("«{nombre}» no es un número válido: «{t}»."))
+    }
+
+    /// Lee los parámetros escritos, los valida y ejecuta de nuevo la simulación.
+    fn calcular(&mut self, cx: &mut Context<Self>) {
+        let leidos = (|| -> Result<(Parametros, f64), String> {
+            let masa = self.leer_campo(&self.in_masa, "Masa inyectada", cx)?;
+            let dur = self.leer_campo(&self.in_dur, "Duración del pulso", cx)?;
+            let dx = self.leer_campo(&self.in_dx, "Paso espacial dx", cx)?;
+            let dt = self.leer_campo(&self.in_dt, "Paso de tiempo dt", cx)?;
+            let tf = self.leer_campo(&self.in_tf, "Tiempo total", cx)? * 60.0;
+            let par = Parametros { duracion_pulso: dur, masa, dx_max: dx, dt, t_final: tf, campo_cada: None };
+            riomat_core::solver::validar(1.0, &par)?;
+            Ok((par, dur))
+        })();
+        match leidos {
+            Ok((par, dur)) => {
+                if !self.durs.iter().any(|d| (d - dur).abs() < 1e-9) {
+                    self.durs.push(dur);
+                    self.durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    if self.durs.len() > 6 {
+                        // Conserva la elegida y las predefinidas más cercanas
+                        let quitar = self.durs.iter().position(|d| !DURACIONES_BASE.contains(d) && (d - dur).abs() > 1e-9);
+                        if let Some(q) = quitar {
+                            self.durs.remove(q);
+                        }
+                    }
+                }
+                self.dur = self.durs.iter().position(|d| (d - dur).abs() < 1e-9).unwrap_or(0);
+                self.par = par;
+                self.error = None;
+                self.recalcular();
+                self.frame = self.frame.min(self.n_frames().saturating_sub(1));
+            }
+            Err(e) => self.error = Some(e),
+        }
+        cx.notify();
+    }
+
+    fn poner(&self, estado: &Entity<InputState>, texto: String, window: &mut Window, cx: &mut Context<Self>) {
+        estado.update(cx, |s, cx| s.set_value(texto, window, cx));
+    }
+
+    fn restablecer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let p = Parametros::default();
+        self.poner(&self.in_masa.clone(), texto_num(p.masa), window, cx);
+        self.poner(&self.in_dur.clone(), texto_num(p.duracion_pulso), window, cx);
+        self.poner(&self.in_dx.clone(), texto_num(p.dx_max), window, cx);
+        self.poner(&self.in_dt.clone(), texto_num(p.dt), window, cx);
+        self.poner(&self.in_tf.clone(), texto_num(p.t_final / 60.0), window, cx);
+        self.durs = DURACIONES_BASE.to_vec();
+        self.par = p;
+        self.dur = 1;
+        self.error = None;
+        self.recalcular();
+        cx.notify();
+    }
+
+    fn set_perfil(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.perfil = i;
+        self.recalcular();
+        cx.notify();
+    }
+
+    fn alternar(&mut self, cx: &mut Context<Self>) {
+        self.playing = !self.playing;
+        self.generacion += 1;
+        if !self.playing {
+            cx.notify();
+            return;
+        }
+        if self.frame + 1 >= self.n_frames() {
+            self.frame = 0;
+        }
+        let g = self.generacion;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                let seguir = this
+                    .update(cx, |this, cx| {
+                        if this.generacion != g || !this.playing {
+                            return false;
+                        }
+                        this.frame = (this.frame + VELOCIDADES[this.vel]).min(this.n_frames() - 1);
+                        if this.frame + 1 >= this.n_frames() {
+                            this.playing = false;
+                        }
+                        cx.notify();
+                        this.playing
+                    })
+                    .unwrap_or(false);
+                if !seguir {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+fn excels_en(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx"))).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn texto_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 { format!("{v:.0}") } else { format!("{v}") }
+}
+
+fn etiqueta_duracion(d: f64) -> String {
+    if d >= 60.0 && (d / 60.0 - (d / 60.0).round()).abs() < 1e-9 { format!("{:.0} min", d / 60.0) } else { format!("{d:.0} s") }
+}
+
+fn fmt_min(v: Option<f64>) -> String {
+    v.map(|m| format!("{m:.1} min")).unwrap_or_else(|| "—".into())
+}
+
+// ---------- piezas visuales ----------
+
+fn seccion(titulo: &'static str) -> Div {
+    div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(DIM)).child(titulo.to_uppercase())
+}
+
+/// Tarjeta con encabezado, como las de la referencia.
+fn tarjeta(titulo: &'static str, leyenda: Vec<(String, u32)>, cuerpo: impl IntoElement) -> Div {
+    let cab = h_flex().items_center().px_3().h(px(34.)).bg(rgb(HEADER)).border_b_1().border_color(rgb(BORDER)).child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(titulo));
+    let leyenda = h_flex().gap_3().flex_wrap().children(leyenda.into_iter().map(|(n, c)| {
+        h_flex().gap_1p5().items_center().child(div().size(px(10.)).rounded_sm().border_2().border_color(rgb(c))).child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(n))
+    }));
+    v_flex().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).overflow_hidden().min_w_0().child(cab).child(v_flex().gap_2().p_3().child(leyenda).child(cuerpo))
+}
+
+fn fila(etiqueta: &'static str, valor: String) -> Div {
+    h_flex()
+        .justify_between()
+        .py(px(6.))
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(etiqueta))
+        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(valor))
+}
+
+fn opcion(id: impl Into<ElementId>, texto: String, activo: bool, color: Option<u32>) -> Stateful<Div> {
+    let mut b = div()
+        .id(id)
+        .px_3()
+        .h(px(30.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded_md()
+        .cursor_pointer()
+        .text_size(px(12.5))
+        .border_1()
+        .border_color(rgb(if activo { ACCENT } else { BORDER }))
+        .bg(if activo { rgba(ACCENT_SOFT) } else { rgb(PANEL).into() })
+        .hover(|s| s.bg(rgb(HOVER)));
+    if let Some(c) = color {
+        b = b.child(div().size(px(9.)).rounded_full().bg(rgb(c)));
+    }
+    b.child(texto)
+}
+
+fn boton(id: &'static str, texto: &'static str, color: u32) -> Stateful<Div> {
+    div().id(id).h(px(28.)).px_4().flex().items_center().rounded_full().cursor_pointer().bg(rgb(color)).text_color(rgb(0xffffff)).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(texto)
+}
+
+/// Logotipo: perfil de río descendiendo, con el pulso como punto.
+fn logo() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |b, _, window, _| {
+            let p = |x: f32, y: f32| point(b.origin.x + px(x), b.origin.y + px(y));
+            let mut pb = PathBuilder::stroke(px(2.2));
+            pb.move_to(p(1.0, 6.0));
+            pb.line_to(p(8.0, 7.0));
+            pb.line_to(p(12.0, 15.0));
+            pb.line_to(p(23.0, 17.0));
+            if let Ok(path) = pb.build() {
+                let c: Hsla = rgb(ACCENT).into();
+                window.paint_path(path, c);
+            }
+            window.paint_quad(fill(Bounds::new(p(5.0, 1.5), size(px(7.), px(7.))), rgb(TRAZ_MEDIO)).corner_radii(px(3.5)));
+        },
+    )
+    .size(px(24.))
+}
+
+fn pastilla(texto: String) -> Div {
+    div().h(px(28.)).px_3().flex().items_center().rounded_full().bg(rgb(0xe3eef5)).text_size(px(12.)).text_color(rgb(MUTED)).child(texto)
+}
+
+impl Render for Riomat {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let raiz = v_flex()
+            .id("raiz")
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .on_drop(cx.listener(|this, p: &ExternalPaths, _, cx| {
+                this.cargar(p.paths());
+                cx.notify();
+            }));
+        if self.hid.is_none() || self.vista.is_none() {
+            return raiz.child(self.vacio(cx));
+        }
+        raiz.child(self.barra_superior(cx)).child(
+            h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(self.centro(cx)).child(self.panel_der()),
+        )
+    }
+}
+
+impl Riomat {
+    fn vacio(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(h_flex().gap_3().items_center().child(logo()).child(div().text_size(px(32.)).font_weight(FontWeight::SEMIBOLD).child("riomat")))
+            .child(div().text_color(rgb(MUTED)).child("Del resultado de HEC-RAS al transporte de un pulso, sin preparar Excel"))
+            .child(
+                v_flex().gap_1().max_w(px(560.)).p_4().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER))
+                    .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("Cómo cargar los datos"))
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("1. En HEC-RAS abre la tabla de resultados por perfil (Profile Table) y elige las columnas: River Sta, Profile, Q Total, W.P. Total, Flow Area, Top Width y E.G. Slope. Si quieres el perfil del río, añade Min Ch El, W.S. Elev y E.G. Elev."))
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("2. Copia la tabla y pulsa «Abrir archivo…» (o «Pegar tabla»), o arrastra aquí un archivo .txt, .csv o .xlsx con esa tabla."))
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("También funcionan los dos Excel anteriores: arrástralos juntos.")),
+            )
+            .children(self.error.clone().map(|e| div().max_w(px(560.)).text_color(rgb(ERR)).child(e)))
+            .child(h_flex().gap_2()
+                .child(boton("abrir", "Abrir archivo…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx))))
+                .child(boton("pegar", "Pegar tabla de HEC-RAS", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))
+                .child(boton("ejemplo", "Cargar datos de ejemplo", RESET).on_click(cx.listener(|this, _, _, cx| {
+                    let v = Riomat::buscar_por_defecto();
+                    this.cargar(&v);
+                    cx.notify();
+                }))))
+    }
+
+    fn barra_superior(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let res = self.actual().unwrap();
+        let (paso, _) = res.campo[self.frame];
+        let t_min = paso as f64 * res.dt / 60.0;
+        let total = res.t.last().copied().unwrap_or(0.0) / 60.0;
+        let reproducir = boton("play", if self.playing { "⏸  Pausar" } else { "▶  Reproducir" }, RUN).on_click(cx.listener(|this, _, _, cx| this.alternar(cx)));
+        let reiniciar = boton("reset", "↺  Reiniciar", RESET).on_click(cx.listener(|this, _, _, cx| {
+            this.playing = false;
+            this.generacion += 1;
+            this.frame = 0;
+            cx.notify();
+        }));
+        let vel = pastilla(format!("Velocidad {}×", VELOCIDADES[self.vel])).id("vel").cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+            this.vel = (this.vel + 1) % VELOCIDADES.len();
+            cx.notify();
+        }));
+        h_flex()
+            .h(px(48.))
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(h_flex().gap_2().items_center().child(logo()).child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("riomat")))
+            .child(div().w(px(1.)).h(px(20.)).bg(rgb(BORDER)))
+            .child(div().text_size(px(13.)).child(format!("Transporte de un pulso · tramo de {:.0} m", h.perfiles[self.perfil].longitud())))
+            .child(reproducir)
+            .child(reiniciar)
+            .child(pastilla(format!("t = {t_min:.0} min  |  {total:.0} min")))
+            .child(vel)
+            .child(div().flex_1())
+            .child(div().text_size(px(11.5)).text_color(rgb(DIM)).child("Riomat v0.1 · trazador pasivo · resultados exploratorios"))
+    }
+
+    fn panel_izq(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let mut perfiles = v_flex().gap_1p5();
+        for (i, pf) in h.perfiles.iter().enumerate() {
+            perfiles = perfiles.child(opcion(("pf", i), format!("{}    {:.1} m³/s", pf.nombre, pf.q), i == self.perfil, None).on_click(cx.listener(move |this, _, _, cx| this.set_perfil(i, cx))));
+        }
+        let mut metodos = v_flex().gap_1p5();
+        for (i, m) in METODOS.iter().enumerate() {
+            metodos = metodos.child(opcion(("m", i), m.nombre().into(), i == self.metodo, Some(color_metodo(*m))).on_click(cx.listener(move |this, _, _, cx| {
+                this.metodo = i;
+                this.frame = this.frame.min(this.n_frames().saturating_sub(1));
+                cx.notify();
+            })));
+        }
+        let mut durs = h_flex().gap_1p5().flex_wrap();
+        for (i, d) in self.durs.iter().enumerate() {
+            let dv = *d;
+            durs = durs.child(opcion(("d", i), etiqueta_duracion(dv), i == self.dur, None).on_click(cx.listener(move |this, _, window, cx| {
+                this.dur = i;
+                this.frame = this.frame.min(this.n_frames().saturating_sub(1));
+                this.poner(&this.in_dur.clone(), texto_num(dv), window, cx);
+                cx.notify();
+            })));
+        }
+        v_flex()
+            .id("izq")
+            .w(px(250.))
+            .h_full()
+            .flex_none()
+            .overflow_y_scroll()
+            .gap_5()
+            .p_4()
+            .bg(rgb(PANEL))
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .child(v_flex().gap_2().child(seccion("Datos HEC-RAS")).children(self.archivos.iter().map(|a| div().text_size(px(11.5)).text_color(rgb(MUTED)).child(a.clone()))).child(boton("abrir2", "Abrir archivo…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx)))).child(boton("pegar2", "Pegar tabla del portapapeles", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))
+                .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("O arrastra a la ventana un archivo con la tabla (o los dos Excel).")))
+            .child(v_flex().gap_2().child(seccion("Caudal")).child(perfiles))
+            .child(v_flex().gap_2().child(seccion("Correlación D_L")).child(metodos))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(seccion("Parámetros de simulación"))
+                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Duración del pulso (rápido)"))
+                    .child(durs)
+                    .child(self.campo("Masa inyectada", "u", &self.in_masa))
+                    .child(self.campo("Duración del pulso", "s", &self.in_dur))
+                    .child(self.campo("Paso espacial dx", "m", &self.in_dx))
+                    .child(self.campo("Paso de tiempo dt", "s", &self.in_dt))
+                    .child(self.campo("Tiempo total", "min", &self.in_tf))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(boton("calcular", "Calcular", ACCENT).on_click(cx.listener(|this, _, _, cx| this.calcular(cx))))
+                            .child(boton("restablecer", "Por defecto", RESET).on_click(cx.listener(|this, _, window, cx| this.restablecer(window, cx)))),
+                    )
+                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Escribe los valores y pulsa Calcular. La masa y la duración del pulso son hipótesis, no mediciones.")),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(seccion("Exportar"))
+                    .child(boton("exportar", "Guardar figuras", ACCENT).on_click(cx.listener(|this, _, _, cx| this.exportar_figuras(cx))))
+                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Guarda las cuatro gráficas actuales en SVG, PNG (300 ppp) y PDF."))
+                    .children(self.export_msg.clone().map(|m| div().text_size(px(11.)).text_color(rgb(OK)).child(m))),
+            )
+    }
+
+    fn campo(&self, etiqueta: &'static str, unidad: &'static str, estado: &Entity<InputState>) -> Div {
+        h_flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(etiqueta))
+            .child(h_flex().items_center().gap_1().child(div().w(px(76.)).child(Input::new(estado))).child(div().w(px(28.)).text_size(px(11.)).text_color(rgb(DIM)).child(unidad)))
+    }
+
+    /// Perfil longitudinal vivo del río: roca, agua coloreada por el trazador, nivel de agua y línea de energía.
+    fn esquema(&self) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let p = &h.perfiles[self.perfil];
+        let res = self.actual().unwrap();
+        let (paso, c) = &res.campo[self.frame];
+        let t = *paso as f64 * res.dt;
+        let n = p.x.len();
+        let xmax = p.x[n - 1].max(1.0);
+        let cmax = res.concentracion_max.max(1e-300);
+        // Cotas: reales de HEC-RAS si están en la tabla; si no, un cauce plano con la profundidad A/B.
+        let con_cotas = p.registros.iter().all(|r| r.cota_fondo.is_some() && r.nivel_agua.is_some());
+        let bed: Vec<f64> = if con_cotas { p.registros.iter().map(|r| r.cota_fondo.unwrap()).collect() } else { vec![0.0; n] };
+        let ws: Vec<f64> = if con_cotas { p.registros.iter().map(|r| r.nivel_agua.unwrap()).collect() } else { (0..n).map(|i| p.a[i] / p.b[i]).collect() };
+        let eg: Option<Vec<f64>> = if p.registros.iter().all(|r| r.cota_energia.is_some()) { Some(p.registros.iter().map(|r| r.cota_energia.unwrap()).collect()) } else { None };
+        let top = eg.as_ref().map(|e| e.iter().cloned().fold(f64::MIN, f64::max)).unwrap_or(0.0).max(ws.iter().cloned().fold(f64::MIN, f64::max));
+        let bot_bed = bed.iter().cloned().fold(f64::MAX, f64::min);
+        let (lo, hi) = (bot_bed - 0.25 * (top - bot_bed).max(1.0), top + 0.08 * (top - bot_bed).max(1.0));
+        // Cortes de agua: color por concentración en cada punto del tramo
+        const K: usize = 160;
+        let cortes: Vec<(f64, f64, f64, f64, u32)> = (0..K)
+            .map(|k| {
+                let (x0, x1) = (xmax * k as f64 / K as f64, xmax * (k + 1) as f64 / K as f64);
+                let xm = 0.5 * (x0 + x1);
+                let col = rampa((interp(xm, &res.x, c) / cmax).max(0.0).sqrt());
+                (x0, x1, interp(xm, &p.x, &bed), interp(xm, &p.x, &ws), col)
+            })
+            .collect();
+        let pts = |v: &[f64]| -> Vec<(f64, f64)> { p.x.iter().cloned().zip(v.iter().cloned()).collect() };
+        let (l_bed, l_ws, l_eg) = (pts(&bed), pts(&ws), eg.as_ref().map(|e| pts(e)));
+        let lienzo = canvas(
+            |_, _, _| (),
+            move |b, _, window, _| {
+                let (w, hh) = (f32::from(b.size.width), f32::from(b.size.height));
+                let pos = |x: f64, e: f64| point(b.origin.x + px((x / xmax) as f32 * w), b.origin.y + px((1.0 - ((e - lo) / (hi - lo)) as f32) * hh));
+                let fondo = |x: f64| point(b.origin.x + px((x / xmax) as f32 * w), b.origin.y + px(hh));
+                // Roca
+                let mut pb = PathBuilder::fill();
+                pb.move_to(fondo(0.0));
+                for &(x, e) in &l_bed {
+                    pb.line_to(pos(x, e));
+                }
+                pb.line_to(fondo(xmax));
+                pb.close();
+                if let Ok(path) = pb.build() {
+                    let col: Hsla = rgb(ROCA).into();
+                    window.paint_path(path, col);
+                }
+                // Agua coloreada por el trazador
+                for &(x0, x1, b0, w0, col) in &cortes {
+                    let mut pb = PathBuilder::fill();
+                    pb.move_to(pos(x0, b0));
+                    pb.line_to(pos(x1 + xmax * 0.0015, b0));
+                    pb.line_to(pos(x1 + xmax * 0.0015, w0));
+                    pb.line_to(pos(x0, w0));
+                    pb.close();
+                    if let Ok(path) = pb.build() {
+                        let c: Hsla = rgb(col).into();
+                        window.paint_path(path, c);
+                    }
+                }
+                let mut trazo = |linea: &[(f64, f64)], ancho: f32, color: u32| {
+                    let mut pb = PathBuilder::stroke(px(ancho));
+                    pb.move_to(pos(linea[0].0, linea[0].1));
+                    for &(x, e) in &linea[1..] {
+                        pb.line_to(pos(x, e));
+                    }
+                    if let Ok(path) = pb.build() {
+                        let c: Hsla = rgb(color).into();
+                        window.paint_path(path, c);
+                    }
+                };
+                trazo(&l_bed, 1.6, ROCA_LINEA);
+                if let Some(e) = &l_eg {
+                    trazo(e, 1.2, ENERGIA);
+                }
+                trazo(&l_ws, 2.0, AGUA_LINEA);
+                for &(x, e) in &l_ws {
+                    let q = pos(x, e);
+                    window.paint_quad(fill(Bounds::new(point(q.x - px(4.), q.y - px(4.)), size(px(8.), px(8.))), rgb(0xffffff)).corner_radii(px(4.)).border_widths(px(2.)).border_color(rgb(AGUA_LINEA)));
+                }
+            },
+        )
+        .size_full();
+        // Etiquetas alternadas en dos filas para que no se pisen
+        let etiqueta = |i: usize, texto: String, color: u32, peso: bool| {
+            let f = (p.x[i] / xmax) as f32;
+            let mut d = div().absolute().left(relative(f)).ml(px(-20.)).w(px(40.)).flex().justify_center().text_size(px(10.5)).text_color(rgb(color)).top(px(if i % 2 == 0 { 2. } else { 16. })).child(texto);
+            if peso {
+                d = d.font_weight(FontWeight::SEMIBOLD);
+            }
+            d
+        };
+        let sup = div().relative().w_full().h(px(32.)).children((0..n).map(|i| etiqueta(i, format!("{:.1}", interp(p.x[i], &res.x, c) * 1e6), TRAZ_ALTO, true)));
+        let inf = div().relative().w_full().h(px(32.)).children((0..n).map(|i| etiqueta(i, format!("{:.0}", p.secciones[i]), MUTED, false)));
+        let entrada_activa = t < self.durs[self.dur];
+        let caja = |titulo: &'static str, l1: String, l2: String, color: u32| {
+            v_flex().w(px(190.)).flex_none().gap_0p5().px_3().py_1p5().rounded_md().border_1().border_color(rgb(color)).bg(rgb(PANEL))
+                .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(color)).child(titulo))
+                .child(div().text_size(px(11.)).child(l1))
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(l2))
+        };
+        let clave = |color: u32, texto: &'static str| h_flex().gap_1p5().items_center().child(div().size(px(10.)).rounded_sm().bg(rgb(color))).child(div().text_size(px(10.5)).text_color(rgb(MUTED)).child(texto));
+        let perfil = v_flex()
+            .w_full()
+            .min_w_0()
+            .px(px(20.))
+            .child(sup)
+            .child(div().w_full().h(px(180.)).rounded_sm().bg(rgb(PLOT_BG)).child(lienzo))
+            .child(inf)
+            .child(h_flex().gap_4().justify_center().child(clave(ROCA, "Roca")).child(clave(AGUA_LINEA, "Nivel del agua")).child(clave(TRAZ_MEDIO, "Agua con trazador")).children(eg.is_some().then(|| clave(ENERGIA, "Línea de energía"))));
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(caja("ENTRADA aguas arriba", format!("M = {:.1} en T = {:.0} s", res.masa, self.durs[self.dur]), if entrada_activa { "● inyectando".into() } else { "○ sin aporte".into() }, if entrada_activa { TRAZ_ALTO } else { DIM }))
+                    .child(caja("SALIDA aguas abajo", format!("Q = {:.1} m³/s", p.q), format!("evacuado {:.1} %", res.salida[*paso] / res.masa * 100.0), ACCENT)),
+            )
+            .child(perfil)
+    }
+
+    fn centro(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let v = self.vista.as_ref().unwrap();
+        let p = &h.perfiles[self.perfil];
+        let res = self.actual().unwrap();
+        let metodo = METODOS[self.metodo];
+        let col = color_metodo(metodo);
+        let (paso, _) = &res.campo[self.frame];
+        let t_min = *paso as f64 * res.dt / 60.0;
+        let leyenda_metodos: Vec<(String, u32)> = METODOS.iter().map(|m| (m.nombre().to_string(), color_metodo(*m))).collect();
+
+        // Barra de tiempo
+        let n = self.n_frames();
+        let mut barra = h_flex().w_full().h(px(20.)).gap(px(1.)).items_center();
+        for s in 0..SEGMENTOS {
+            let f = (s * (n - 1)) / (SEGMENTOS - 1);
+            let pasado = f <= self.frame;
+            barra = barra.child(div().id(("seg", s)).flex_1().h(if pasado { px(12.) } else { px(7.) }).rounded_sm().cursor_pointer().bg(if pasado { rgb(ACCENT) } else { rgb(0xd5e0e8) }).on_click(cx.listener(move |this, _, _, cx| {
+                this.frame = f;
+                cx.notify();
+            })));
+        }
+
+        let tile = |etq: &str, val: String| {
+            v_flex().flex_1().gap_0p5().px_3().py_2().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).min_w_0()
+                .child(div().text_size(px(21.)).font_weight(FontWeight::SEMIBOLD).child(val))
+                .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child(etq.to_string()))
+        };
+        let dmin = v.d[self.metodo].iter().cloned().fold(f64::INFINITY, f64::min);
+        let dmax = v.d[self.metodo].iter().cloned().fold(0.0, f64::max);
+        let tiles = h_flex()
+            .gap_3()
+            .child(tile("t50: mitad de la masa evacuada", fmt_min(res.t50_min)))
+            .child(tile("t95: 95 % evacuado", fmt_min(res.t95_min)))
+            .child(tile("D_L mín – máx (m²/s)", format!("{dmin:.0} – {dmax:.0}")))
+            .child(tile(&format!("Evacuado en {:.1} h", res.t.last().copied().unwrap_or(0.0) / 3600.0), format!("{:.2} %", res.fraccion_salida * 100.0)));
+
+        // Gráficas: se construyen desde las mismas figuras que se exportan.
+        let figs = self.figuras().unwrap_or_default();
+        let dibujar = |i: usize| {
+            let f = figs[i].clone();
+            grafica(f.series, f.marcas, f.ejes, 190.0)
+        };
+        let (g1, g2, g3, g4) = (dibujar(0), dibujar(1), dibujar(2), dibujar(3));
+
+        v_flex()
+            .id("centro")
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .gap_3()
+            .p_4()
+            .child(tarjeta("Perfil longitudinal del río · el agua se tiñe con el trazador", vec![], v_flex().gap_2().child(self.esquema()).child(div().text_size(px(10.5)).text_color(rgb(DIM)).child("Arriba: concentración en cada sección (×10⁻⁶ masa/m³). Abajo: estación HEC-RAS. Distancias a escala, alturas exageradas. Clic en la barra para saltar en el tiempo.")).child(barra)))
+            .child(tiles)
+            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Concentración a lo largo del tramo", vec![(metodo.nombre().to_string(), col)], g1))).child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda_metodos.clone(), g2))))
+            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Dispersión D_L por sección", leyenda_metodos.clone(), g3))).child(div().flex_1().min_w_0().child(tarjeta("Sensibilidad a la duración del pulso", leyenda_metodos, g4))))
+    }
+
+    /// Datos de las cuatro gráficas del estado actual (los mismos que se dibujan en pantalla y se exportan).
+    fn figuras(&self) -> Option<Vec<Figura>> {
+        let h = self.hid.as_ref()?;
+        let v = self.vista.as_ref()?;
+        let p = &h.perfiles[self.perfil];
+        let res = self.actual()?;
+        let metodo = METODOS[self.metodo];
+        let col = color_metodo(metodo);
+        let (paso, _) = &res.campo[self.frame];
+        let t_min = *paso as f64 * res.dt / 60.0;
+        let contexto = format!("{} · Q = {:.1} m³/s · {}", p.nombre, p.q, metodo.nombre());
+        let s = |n: &str, puntos: Vec<(f64, f64)>, color: u32, grosor: f32, relleno: bool, opaca: bool| Serie { nombre: n.to_string(), puntos, color, grosor, relleno, opaca };
+        let mut figs = Vec::new();
+
+        // 1) Concentración a lo largo del tramo
+        let cmax = res.campo[self.frame].1.iter().cloned().fold(0.0, f64::max) * 1e6;
+        let ytop = techo_bonito((cmax * 1.1).max(1e-6));
+        let pts: Vec<(f64, f64)> = res.x.iter().zip(&res.campo[self.frame].1).map(|(x, c)| (x / 1000.0, c * 1e6)).collect();
+        let xmax = res.x.last().copied().unwrap_or(1.0) / 1000.0;
+        figs.push(Figura {
+            nombre: format!("concentracion_t{:.0}min", t_min),
+            titulo: format!("Concentración a t = {t_min:.0} min · {contexto}"),
+            series: vec![s(metodo.nombre(), pts, col, 2.2, true, true)],
+            marcas: vec![],
+            ejes: Ejes { x: (0.0, xmax), y: (0.0, ytop), x_log: false, y_log: false, x_ticks: ticks_lineales(0.0, xmax, 6), y_ticks: ticks_lineales(0.0, ytop, 5), x_titulo: "Distancia aguas abajo (km)".into(), y_titulo: "Concentración (×10⁻⁶ masa/m³) · escala automática".into() },
+        });
+
+        // 2) Masa evacuada acumulada
+        let mut series2 = vec![];
+        for (mi, m) in METODOS.iter().enumerate() {
+            let r = &v.sims[&(mi, self.dur)];
+            let puntos: Vec<(f64, f64)> = (0..r.t.len()).step_by(4).map(|j| (r.t[j] / 60.0, r.salida[j] / r.masa)).collect();
+            series2.push(s(m.nombre(), puntos, color_metodo(*m), if mi == self.metodo { 2.6 } else { 1.4 }, false, mi == self.metodo));
+        }
+        let tfin = res.t.last().copied().unwrap_or(1.0) / 60.0;
+        figs.push(Figura {
+            nombre: "masa_evacuada".into(),
+            titulo: format!("Masa evacuada acumulada · {} · Q = {:.1} m³/s · pulso de {}", p.nombre, p.q, etiqueta_duracion(self.durs[self.dur])),
+            series: series2,
+            marcas: vec![Marca { x: t_min, y: res.salida[*paso] / res.masa, color: col }],
+            ejes: Ejes { x: (0.0, tfin), y: (0.0, 1.0), x_log: false, y_log: false, x_ticks: ticks_lineales(0.0, tfin, 5), y_ticks: ticks_lineales(0.0, 1.0, 5), x_titulo: "Tiempo (min)".into(), y_titulo: "Fracción evacuada".into() },
+        });
+
+        // 3) D_L por sección (escala logarítmica)
+        let (mut lo, mut hi) = (f64::INFINITY, 0.0_f64);
+        for d in &v.d {
+            for &x in d {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        let (k0, k1) = (lo.log10().floor() as i32, hi.log10().ceil() as i32);
+        let lmax = p.x.last().copied().unwrap_or(1.0) / 1000.0;
+        let series3: Vec<Serie> = METODOS.iter().enumerate().map(|(mi, m)| s(m.nombre(), p.x.iter().map(|x| x / 1000.0).zip(v.d[mi].iter().cloned()).collect(), color_metodo(*m), if mi == self.metodo { 2.6 } else { 1.4 }, false, mi == self.metodo)).collect();
+        figs.push(Figura {
+            nombre: "dispersion_DL".into(),
+            titulo: format!("Coeficiente de dispersión D_L por sección · {} · Q = {:.1} m³/s", p.nombre, p.q),
+            series: series3,
+            marcas: vec![],
+            ejes: Ejes { x: (0.0, lmax), y: (10f64.powi(k0), 10f64.powi(k1)), x_log: false, y_log: true, x_ticks: ticks_lineales(0.0, lmax, 6), y_ticks: (k0..=k1).map(|k| 10f64.powi(k)).collect(), x_titulo: "Distancia aguas abajo (km)".into(), y_titulo: "D_L (m²/s)".into() },
+        });
+
+        // 4) Sensibilidad a la duración del pulso
+        let mut series4 = vec![];
+        let mut tmax = 0.0_f64;
+        for (mi, m) in METODOS.iter().enumerate() {
+            for sel in [true, false] {
+                let puntos: Vec<(f64, f64)> = self.durs.iter().enumerate().filter_map(|(di, d)| {
+                    let r = &v.sims[&(mi, di)];
+                    let y = if sel { r.t50_min } else { r.t95_min }?;
+                    tmax = tmax.max(y);
+                    Some((*d, y))
+                }).collect();
+                series4.push(s(if sel { m.nombre() } else { "" }, puntos, color_metodo(*m), if mi == self.metodo { 2.4 } else { 1.2 }, false, mi == self.metodo));
+            }
+        }
+        let ytop4 = techo_bonito(tmax * 1.05);
+        figs.push(Figura {
+            nombre: "sensibilidad_pulso".into(),
+            titulo: format!("Sensibilidad a la duración del pulso · {} · Q = {:.1} m³/s", p.nombre, p.q),
+            series: series4,
+            marcas: res.t50_min.map(|y| vec![Marca { x: self.durs[self.dur], y, color: col }]).unwrap_or_default(),
+            ejes: Ejes { x: (self.durs[0], *self.durs.last().unwrap()), y: (0.0, ytop4), x_log: true, y_log: false, x_ticks: self.durs.clone(), y_ticks: ticks_lineales(0.0, ytop4, 5), x_titulo: "Duración del pulso (s) · t50 abajo, t95 arriba".into(), y_titulo: "Tiempo (min)".into() },
+        });
+        Some(figs)
+    }
+
+    /// Guarda las figuras actuales en una carpeta nueva (SVG, PNG a 300 ppp y PDF) sin bloquear la ventana.
+    fn exportar_figuras(&mut self, cx: &mut Context<Self>) {
+        let Some(figs) = self.figuras() else { return };
+        if self.exportando {
+            return;
+        }
+        self.exportando = true;
+        self.export_msg = Some("Exportando figuras…".into());
+        let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let marca = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let nombre_perfil = self.hid.as_ref().map(|h| h.perfiles[self.perfil].nombre.replace(' ', "")).unwrap_or_default();
+        let dir = base.join("Documents").join("riomat-export").join(format!("{nombre_perfil}-{marca}"));
+        let tarea = cx.background_executor().spawn(async move {
+            let r = std::panic::catch_unwind(move || -> Result<usize, String> {
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                for f in &figs {
+                    let svg = a_svg(f, 720.0, 380.0);
+                    std::fs::write(dir.join(format!("{}.svg", f.nombre)), &svg).map_err(|e| e.to_string())?;
+                    std::fs::write(dir.join(format!("{}.png", f.nombre)), svg_a_png(&svg, 3.0)?).map_err(|e| e.to_string())?;
+                    std::fs::write(dir.join(format!("{}.pdf", f.nombre)), svg_a_pdf(&svg)?).map_err(|e| e.to_string())?;
+                }
+                Ok(figs.len())
+            })
+            .unwrap_or_else(|_| Err("fallo interno al generar las imágenes".into()));
+            (r, base.join("Documents").join("riomat-export"))
+        });
+        cx.spawn(async move |this, cx| {
+            let (r, raiz) = tarea.await;
+            let _ = this.update(cx, |this, cx| {
+                this.exportando = false;
+                this.export_msg = Some(match r {
+                    Ok(n) => format!("{n} figuras guardadas (SVG, PNG y PDF) en {}", raiz.display()),
+                    Err(e) => format!("No se pudo exportar: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Abre el selector de archivos del sistema y carga lo elegido.
+    fn abrir_dialogo(&mut self, cx: &mut Context<Self>) {
+        let tarea = cx.background_executor().spawn(async move {
+            rfd::AsyncFileDialog::new()
+                .set_title("Elige la tabla de HEC-RAS (o los dos Excel)")
+                .add_filter("Tablas (xlsx, csv, txt)", &["xlsx", "xls", "csv", "txt", "tsv"])
+                .pick_files()
+                .await
+                .map(|v| v.into_iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>())
+        });
+        cx.spawn(async move |this, cx| {
+            if let Some(rutas) = tarea.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.cargar(&rutas);
+                    this.frame = 0;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn panel_der(&self) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let v = self.vista.as_ref().unwrap();
+        let p = &h.perfiles[self.perfil];
+        let res = self.actual().unwrap();
+        let (paso, _) = res.campo[self.frame];
+        let sec = (paso as f64 * res.dt) / 60.0;
+        let (mut cour, mut pe) = (0.0_f64, 0.0_f64);
+        let d = &v.d[self.metodo];
+        for &x in &res.x {
+            let a = interp(x, &p.x, &p.a);
+            let dl = interp(x, &p.x, d);
+            let u = res.q / a;
+            cour = cour.max(u * res.dt / res.dx);
+            pe = pe.max(u * res.dx / dl);
+        }
+        let mediana = {
+            let mut s = d.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let dmax = d.iter().cloned().fold(0.0, f64::max);
+        let mut avisos: Vec<(Nivel, &'static str, String)> = vec![];
+        let nv = |c: bool| if c { Nivel::Info } else { Nivel::Aviso };
+        avisos.push((nv(res.error_balance < 1e-9), "Balance de masa", format!("Error {:.1e}. Prueba la conservación numérica, no la exactitud física.", res.error_balance)));
+        avisos.push((nv(pe < 2.0), "Número de Péclet", format!("Máximo por celda {pe:.2}{}", if pe < 2.0 { ": domina la difusión." } else { ": domina la advección; hay difusión numérica del esquema upwind." })));
+        avisos.push((Nivel::Info, "Número de Courant", format!("Máximo {cour:.2}. El esquema implícito es estable para cualquier valor.")));
+        if dmax > 4.0 * mediana {
+            avisos.push((Nivel::Aviso, "D_L extremo", format!("El máximo ({dmax:.0} m²/s) es {:.1}× la mediana de las secciones: revisar ancho efectivo y pendiente.", dmax / mediana)));
+        }
+        if res.fraccion_salida < 0.999 {
+            avisos.push((Nivel::Aviso, "Tiempo simulado", format!("A las {:.1} h solo salió el {:.2} % de la masa; t95 puede quedar fuera. Aumenta el tiempo total y pulsa Calcular.", res.t.last().copied().unwrap_or(0.0) / 3600.0, res.fraccion_salida * 100.0)));
+        }
+        for a in &h.avisos {
+            avisos.push((a.nivel.clone(), "Datos HEC-RAS", a.mensaje.clone()));
+        }
+        if let Some(e) = &self.error {
+            avisos.push((Nivel::Error, "Error", e.clone()));
+        }
+        let lista = v_flex().children(avisos.into_iter().map(|(n, comp, m)| {
+            let c = match n {
+                Nivel::Info => OK,
+                Nivel::Aviso => WARN,
+                Nivel::Error => ERR,
+            };
+            v_flex().gap_0p5().py_2().border_b_1().border_color(rgb(BORDER))
+                .child(h_flex().gap_2().items_center().child(div().size(px(8.)).rounded_full().bg(rgb(c))).child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(comp)))
+                .child(div().pl(px(16.)).text_size(px(11.5)).text_color(rgb(MUTED)).child(m))
+        }));
+        v_flex()
+            .id("telemetria")
+            .w(px(320.))
+            .h_full()
+            .flex_none()
+            .overflow_y_scroll()
+            .bg(rgb(PANEL))
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .child(div().px_4().h(px(40.)).flex().items_center().bg(rgb(HEADER)).text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Telemetría en vivo"))
+            .child(
+                v_flex().px_4().py_2()
+                    .child(fila("Vista", "Resumen del sistema".into()))
+                    .child(fila("Tiempo simulado", format!("{sec:.0} min")))
+                    .child(fila("Caudal", format!("{:.2} m³/s", p.q)))
+                    .child(fila("Masa inyectada", format!("{:.4}", res.inyectada[paso])))
+                    .child(fila("Masa en el tramo", format!("{:.4}", res.masa_dominio[paso])))
+                    .child(fila("Masa evacuada", format!("{:.4}", res.salida[paso])))
+                    .child(fila("Concentración máx.", format!("{:.2e}", res.concentracion_max)))
+                    .child(fila("Malla", format!("dx {:.2} m · dt {:.0} s", res.dx, res.dt))),
+            )
+            .child(div().px_4().pt_3().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Registro de verificación y advertencias"))
+            .child(div().px_4().pb_4().child(lista))
+    }
+}

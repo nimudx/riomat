@@ -1,0 +1,12 @@
+[package]
+name = "riomat"
+description = "Riomat: simulador 1D de transporte de trazador en ríos a partir de datos de HEC-RAS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+riomat-core.workspace = true
+riomat-plot.workspace = true
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }

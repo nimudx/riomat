@@ -1,0 +1,9 @@
+[package]
+name = "riomat-plot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+resvg = "0.50.0"
+svg2pdf = "0.13.0"

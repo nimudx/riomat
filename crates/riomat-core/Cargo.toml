@@ -1,0 +1,13 @@
+[package]
+name = "riomat-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+calamine = "0.38.0"
+csv = "1.4.0"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5.1"
