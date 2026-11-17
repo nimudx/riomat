@@ -69,6 +69,7 @@ pub struct Riomat {
     pestana: Pestana,
     fig_sel: usize,
     ver_avisos: bool,
+    ancho: f32,
     sens: Option<Vec<analisis::FilaSens>>,
     sens_error: Option<String>,
     criticas: Vec<f64>,
@@ -96,7 +97,7 @@ impl Riomat {
         );
         let in_kd = campo("2".into(), "×", window, cx);
         let in_pa = campo("10".into(), "%", window, cx);
-        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, ancho: 1400.0, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
         let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
         if !rutas.is_empty() {
             s.cargar(&rutas);
@@ -178,6 +179,11 @@ impl Riomat {
 
     fn actual(&self) -> Option<&Resultado> {
         self.vista.as_ref()?.sims.get(&(self.metodo, self.dur))
+    }
+
+    /// Fotograma inicial: un instante con trazador en el tramo (no el t = 0 vacío).
+    fn frame_inicial(&self) -> usize {
+        4.min(self.n_frames().saturating_sub(1))
     }
 
     fn n_frames(&self) -> usize {
@@ -321,7 +327,7 @@ fn tarjeta(titulo: &'static str, leyenda: Vec<(String, u32)>, cuerpo: impl IntoE
     let leyenda = h_flex().gap_3().flex_wrap().children(leyenda.into_iter().map(|(n, c)| {
         h_flex().gap_1p5().items_center().child(div().size(px(10.)).rounded_sm().border_2().border_color(rgb(c))).child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(n))
     }));
-    v_flex().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).overflow_hidden().min_w_0().child(cab).child(v_flex().gap_2().p_3().child(leyenda).child(cuerpo))
+    v_flex().flex_none().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).overflow_hidden().min_w_0().child(cab).child(v_flex().gap_2().p_3().child(leyenda).child(cuerpo))
 }
 
 /// Tabla de texto con columnas de igual ancho.
@@ -395,7 +401,8 @@ fn pastilla(texto: String) -> Div {
 }
 
 impl Render for Riomat {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ancho = f32::from(window.viewport_size().width);
         let raiz = v_flex()
             .id("raiz")
             .size_full()
@@ -510,7 +517,7 @@ impl Riomat {
             .child(div().w(px(1.)).h(px(20.)).bg(rgb(BORDER)))
             .child(pestanas)
             .child(div().flex_1())
-            .children(simulando.then(|| h_flex().gap_2().items_center().child(reproducir).child(reiniciar).child(pastilla(format!("{t_min:.0} / {total:.0} min"))).child(vel)))
+            .children(simulando.then(|| h_flex().gap_2().items_center().child(reproducir).child(reiniciar).children((self.ancho >= 1030.0).then(|| pastilla(format!("{t_min:.0} / {total:.0} min")))).children((self.ancho >= 1200.0).then(|| vel))))
             .child(insignia)
     }
 
@@ -684,6 +691,7 @@ impl Riomat {
         };
         let clave = |color: u32, texto: &'static str| h_flex().gap_1p5().items_center().child(div().size(px(10.)).rounded_sm().bg(rgb(color))).child(div().text_size(px(10.5)).text_color(rgb(MUTED)).child(texto));
         let perfil = v_flex()
+            .flex_none()
             .w_full()
             .min_w_0()
             .px(px(20.))
@@ -692,9 +700,11 @@ impl Riomat {
             .child(inf)
             .child(h_flex().gap_4().justify_center().child(clave(ROCA, "Roca")).child(clave(AGUA_LINEA, "Nivel del agua")).child(clave(TRAZ_MEDIO, "Agua con trazador")).children(eg.is_some().then(|| clave(ENERGIA, "Línea de energía"))));
         v_flex()
+            .flex_none()
             .gap_2()
             .child(
                 h_flex()
+                    .flex_none()
                     .justify_between()
                     .child(caja("ENTRADA aguas arriba", format!("M = {:.1} en T = {:.0} s", res.masa, self.durs[self.dur]), if entrada_activa { "● inyectando".into() } else { "○ sin aporte".into() }, if entrada_activa { TRAZ_ALTO } else { DIM }))
                     .child(caja("SALIDA aguas abajo", format!("Q = {:.1} m³/s", p.q), format!("evacuado {:.1} %", res.salida[*paso] / res.masa * 100.0), ACCENT)),
@@ -715,7 +725,7 @@ impl Riomat {
 
         // Barra de tiempo
         let n = self.n_frames();
-        let mut barra = h_flex().w_full().h(px(20.)).gap(px(1.)).items_center();
+        let mut barra = h_flex().flex_none().w_full().h(px(20.)).gap(px(1.)).items_center();
         for s in 0..SEGMENTOS {
             let f = (s * (n - 1)) / (SEGMENTOS - 1);
             let pasado = f <= self.frame;
@@ -733,6 +743,7 @@ impl Riomat {
         let dmin = v.d[self.metodo].iter().cloned().fold(f64::INFINITY, f64::min);
         let dmax = v.d[self.metodo].iter().cloned().fold(0.0, f64::max);
         let tiles = h_flex()
+            .flex_none()
             .gap_3()
             .child(tile("t50: mitad de la masa evacuada", fmt_min(res.t50_min)))
             .child(tile("t95: 95 % evacuado", fmt_min(res.t95_min)))
@@ -757,7 +768,7 @@ impl Riomat {
             .p_4()
             .child(tarjeta("Perfil longitudinal del río", vec![], v_flex().gap_2().child(self.esquema()).child(barra)))
             .child(tiles)
-            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Concentración a lo largo del tramo", vec![(metodo.nombre().to_string(), col)], g1))).child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda_metodos, g2))))
+            .child(h_flex().flex_none().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Concentración a lo largo del tramo", vec![(metodo.nombre().to_string(), col)], g1))).child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda_metodos, g2))))
     }
 
     /// Datos de las cuatro gráficas del estado actual (los mismos que se dibujan en pantalla y se exportan).
@@ -776,7 +787,9 @@ impl Riomat {
 
         // 1) Concentración a lo largo del tramo
         let cmax = res.campo[self.frame].1.iter().cloned().fold(0.0, f64::max) * 1e6;
-        let ytop = techo_bonito((cmax * 1.1).max(1e-6));
+        // Si el instante está vacío (t = 0) se usa el máximo de toda la simulación para que el eje tenga sentido.
+        let cref = if cmax > 1e-9 { cmax } else { res.concentracion_max * 1e6 };
+        let ytop = techo_bonito((cref * 1.1).max(1e-6));
         let pts: Vec<(f64, f64)> = res.x.iter().zip(&res.campo[self.frame].1).map(|(x, c)| (x / 1000.0, c * 1e6)).collect();
         let xmax = res.x.last().copied().unwrap_or(1.0) / 1000.0;
         figs.push(Figura {
@@ -914,7 +927,7 @@ impl Riomat {
             .overflow_y_scroll()
             .gap_3()
             .p_4()
-            .child(h_flex().gap_4().items_start().child(lista).child(v_flex().flex_1().min_w_0().gap_3().child(vista).child(botones)))
+            .child(h_flex().flex_none().gap_4().items_start().child(lista).child(v_flex().flex_1().min_w_0().gap_3().child(vista).child(botones)))
             .into_any_element()
     }
 
@@ -1125,7 +1138,7 @@ impl Riomat {
             if let Some(rutas) = tarea.await {
                 let _ = this.update(cx, |this, cx| {
                     this.cargar(&rutas);
-                    this.frame = 0;
+                    this.frame = this.frame_inicial();
                     cx.notify();
                 });
             }

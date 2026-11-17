@@ -13,9 +13,16 @@ fn main() {
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Light, None, cx);
+        // La ventana se adapta a la pantalla (en Windows con escala del 125-150 % el espacio lógico es menor).
+        let (mut ancho, mut alto) = (1380.0_f32, 860.0_f32);
+        if let Some(d) = cx.primary_display() {
+            let b = d.bounds();
+            ancho = ancho.min(f32::from(b.size.width) * 0.94);
+            alto = alto.min(f32::from(b.size.height) * 0.88);
+        }
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1380.), px(860.)), cx))),
-            window_min_size: Some(size(px(1000.), px(600.))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(ancho), px(alto)), cx))),
+            window_min_size: Some(size(px(860.), px(520.))),
             titlebar: Some(TitlebarOptions { title: Some("Riomat".into()), ..Default::default() }),
             app_id: Some("riomat".into()),
             ..Default::default()
