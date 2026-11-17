@@ -1,3 +1,4 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 //! Riomat: simulador 1D de transporte de trazador en ríos a partir de datos de HEC-RAS.
 mod app;
 mod plot;

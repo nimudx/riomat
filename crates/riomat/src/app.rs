@@ -37,6 +37,13 @@ fn rampa(t: f64) -> u32 {
     m(16) | m(8) | m(0)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Pestana {
+    Simulacion,
+    Figuras,
+    Datos,
+}
+
 struct Vista {
     sims: HashMap<(usize, usize), Resultado>,
     d: Vec<Vec<f64>>,
@@ -56,6 +63,9 @@ pub struct Riomat {
     vista: Option<Vista>,
     export_msg: Option<String>,
     exportando: bool,
+    pestana: Pestana,
+    fig_sel: usize,
+    ver_avisos: bool,
     durs: Vec<f64>,
     par: Parametros,
     in_masa: Entity<InputState>,
@@ -76,7 +86,7 @@ impl Riomat {
             campo(texto_num(par.dt), "s", window, cx),
             campo(texto_num(par.t_final / 60.0), "min", window, cx),
         );
-        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
         let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
         if !rutas.is_empty() {
             s.cargar(&rutas);
@@ -374,9 +384,14 @@ impl Render for Riomat {
         if self.hid.is_none() || self.vista.is_none() {
             return raiz.child(self.vacio(cx));
         }
-        raiz.child(self.barra_superior(cx)).child(
-            h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(self.centro(cx)).child(self.panel_der()),
-        )
+        let centro = match self.pestana {
+            Pestana::Simulacion => self.centro(cx).into_any_element(),
+            Pestana::Figuras => self.vista_figuras(cx).into_any_element(),
+            Pestana::Datos => self.vista_datos(cx).into_any_element(),
+        };
+        let cuerpo = h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(centro);
+        let cuerpo = if self.ver_avisos { cuerpo.child(self.panel_der(cx)) } else { cuerpo };
+        raiz.child(self.barra_superior(cx)).child(cuerpo)
     }
 }
 
@@ -424,6 +439,35 @@ impl Riomat {
             this.vel = (this.vel + 1) % VELOCIDADES.len();
             cx.notify();
         }));
+        let simulando = self.pestana == Pestana::Simulacion;
+        let avisos = self.avisos_lista();
+        let n_av = avisos.iter().filter(|(n, _, _)| !matches!(n, Nivel::Info)).count();
+        let insignia = h_flex()
+            .id("insignia")
+            .gap_1p5()
+            .h(px(28.))
+            .px_3()
+            .items_center()
+            .rounded_full()
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(if n_av == 0 { OK } else { WARN }))
+            .text_size(px(12.))
+            .text_color(rgb(if n_av == 0 { OK } else { WARN }))
+            .child(if n_av == 0 { "✓ Verificado".to_string() } else { format!("⚠ {n_av} avisos") })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.ver_avisos = !this.ver_avisos;
+                cx.notify();
+            }));
+        let pestanas = h_flex().gap_1().children([(Pestana::Simulacion, "Simulación"), (Pestana::Figuras, "Figuras"), (Pestana::Datos, "Datos")].into_iter().enumerate().map(|(i, (p, t))| {
+            let activa = self.pestana == p;
+            div().id(("pest", i)).h(px(48.)).px_3().flex().items_center().cursor_pointer().text_size(px(13.)).font_weight(if activa { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                .text_color(rgb(if activa { ACCENT } else { MUTED })).border_b_2().border_color(if activa { rgb(ACCENT) } else { rgb(PANEL) }).child(t)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pestana = p;
+                    cx.notify();
+                }))
+        }));
         h_flex()
             .h(px(48.))
             .flex_none()
@@ -435,13 +479,10 @@ impl Riomat {
             .border_color(rgb(BORDER))
             .child(h_flex().gap_2().items_center().child(logo()).child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).text_color(rgb(ACCENT)).child("riomat")))
             .child(div().w(px(1.)).h(px(20.)).bg(rgb(BORDER)))
-            .child(div().text_size(px(13.)).child(format!("Transporte de un pulso · tramo de {:.0} m", h.perfiles[self.perfil].longitud())))
-            .child(reproducir)
-            .child(reiniciar)
-            .child(pastilla(format!("t = {t_min:.0} min  |  {total:.0} min")))
-            .child(vel)
+            .child(pestanas)
             .child(div().flex_1())
-            .child(div().text_size(px(11.5)).text_color(rgb(DIM)).child("Riomat v0.1 · trazador pasivo · resultados exploratorios"))
+            .children(simulando.then(|| h_flex().gap_2().items_center().child(reproducir).child(reiniciar).child(pastilla(format!("{t_min:.0} / {total:.0} min"))).child(vel)))
+            .child(insignia)
     }
 
     fn panel_izq(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -479,36 +520,25 @@ impl Riomat {
             .bg(rgb(PANEL))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .child(v_flex().gap_2().child(seccion("Datos HEC-RAS")).children(self.archivos.iter().map(|a| div().text_size(px(11.5)).text_color(rgb(MUTED)).child(a.clone()))).child(boton("abrir2", "Abrir archivo…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx)))).child(boton("pegar2", "Pegar tabla del portapapeles", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))
-                .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("O arrastra a la ventana un archivo con la tabla (o los dos Excel).")))
+            .child(v_flex().gap_2().child(seccion("Datos")).children(self.archivos.iter().map(|a| div().text_size(px(11.5)).text_color(rgb(MUTED)).truncate().child(a.clone()))).child(h_flex().gap_2().child(boton("abrir2", "Abrir…", ACCENT).on_click(cx.listener(|this, _, _, cx| this.abrir_dialogo(cx)))).child(boton("pegar2", "Pegar", RESET).on_click(cx.listener(|this, _, _, cx| this.pegar(cx))))))
             .child(v_flex().gap_2().child(seccion("Caudal")).child(perfiles))
             .child(v_flex().gap_2().child(seccion("Correlación D_L")).child(metodos))
             .child(
                 v_flex()
                     .gap_2()
                     .child(seccion("Parámetros de simulación"))
-                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Duración del pulso (rápido)"))
                     .child(durs)
-                    .child(self.campo("Masa inyectada", "u", &self.in_masa))
-                    .child(self.campo("Duración del pulso", "s", &self.in_dur))
-                    .child(self.campo("Paso espacial dx", "m", &self.in_dx))
-                    .child(self.campo("Paso de tiempo dt", "s", &self.in_dt))
-                    .child(self.campo("Tiempo total", "min", &self.in_tf))
+                    .child(self.campo("Masa", "u", &self.in_masa))
+                    .child(self.campo("Pulso", "s", &self.in_dur))
+                    .child(self.campo("dx", "m", &self.in_dx))
+                    .child(self.campo("dt", "s", &self.in_dt))
+                    .child(self.campo("Tiempo", "min", &self.in_tf))
                     .child(
                         h_flex()
                             .gap_2()
                             .child(boton("calcular", "Calcular", ACCENT).on_click(cx.listener(|this, _, _, cx| this.calcular(cx))))
                             .child(boton("restablecer", "Por defecto", RESET).on_click(cx.listener(|this, _, window, cx| this.restablecer(window, cx)))),
                     )
-                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Escribe los valores y pulsa Calcular. La masa y la duración del pulso son hipótesis, no mediciones.")),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(seccion("Exportar"))
-                    .child(boton("exportar", "Guardar figuras", ACCENT).on_click(cx.listener(|this, _, _, cx| this.exportar_figuras(cx))))
-                    .child(div().text_size(px(11.)).text_color(rgb(DIM)).child("Guarda las cuatro gráficas actuales en SVG, PNG (300 ppp) y PDF."))
-                    .children(self.export_msg.clone().map(|m| div().text_size(px(11.)).text_color(rgb(OK)).child(m))),
             )
     }
 
@@ -684,9 +714,9 @@ impl Riomat {
         let figs = self.figuras().unwrap_or_default();
         let dibujar = |i: usize| {
             let f = figs[i].clone();
-            grafica(f.series, f.marcas, f.ejes, 190.0)
+            grafica(f.series, f.marcas, f.ejes, 300.0)
         };
-        let (g1, g2, g3, g4) = (dibujar(0), dibujar(1), dibujar(2), dibujar(3));
+        let (g1, g2) = (dibujar(0), dibujar(1));
 
         v_flex()
             .id("centro")
@@ -696,10 +726,9 @@ impl Riomat {
             .overflow_y_scroll()
             .gap_3()
             .p_4()
-            .child(tarjeta("Perfil longitudinal del río · el agua se tiñe con el trazador", vec![], v_flex().gap_2().child(self.esquema()).child(div().text_size(px(10.5)).text_color(rgb(DIM)).child("Arriba: concentración en cada sección (×10⁻⁶ masa/m³). Abajo: estación HEC-RAS. Distancias a escala, alturas exageradas. Clic en la barra para saltar en el tiempo.")).child(barra)))
+            .child(tarjeta("Perfil longitudinal del río", vec![], v_flex().gap_2().child(self.esquema()).child(barra)))
             .child(tiles)
-            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Concentración a lo largo del tramo", vec![(metodo.nombre().to_string(), col)], g1))).child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda_metodos.clone(), g2))))
-            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Dispersión D_L por sección", leyenda_metodos.clone(), g3))).child(div().flex_1().min_w_0().child(tarjeta("Sensibilidad a la duración del pulso", leyenda_metodos, g4))))
+            .child(h_flex().gap_3().items_start().child(div().flex_1().min_w_0().child(tarjeta("Concentración a lo largo del tramo", vec![(metodo.nombre().to_string(), col)], g1))).child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda_metodos, g2))))
     }
 
     /// Datos de las cuatro gráficas del estado actual (los mismos que se dibujan en pantalla y se exportan).
@@ -789,6 +818,115 @@ impl Riomat {
         Some(figs)
     }
 
+    fn carpeta_export() -> PathBuf {
+        let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        base.join("Documents").join("riomat-export")
+    }
+
+    /// Guarda una sola figura (`formato`: "png", "svg" o "pdf") en la carpeta de exportación, sin bloquear la ventana.
+    fn guardar_figura(&mut self, idx: usize, formato: &'static str, cx: &mut Context<Self>) {
+        let Some(f) = self.figuras().and_then(|v| v.into_iter().nth(idx)) else { return };
+        let raiz = Self::carpeta_export();
+        self.export_msg = Some("Guardando…".into());
+        let tarea = cx.background_executor().spawn(async move {
+            std::panic::catch_unwind(move || -> Result<PathBuf, String> {
+                std::fs::create_dir_all(&raiz).map_err(|e| format!("{}: {e}", raiz.display()))?;
+                let svg = a_svg(&f, 720.0, 380.0);
+                let (bytes, ext) = match formato {
+                    "svg" => (svg.into_bytes(), "svg"),
+                    "pdf" => (svg_a_pdf(&svg)?, "pdf"),
+                    _ => (svg_a_png(&svg, 3.0)?, "png"),
+                };
+                let destino = raiz.join(format!("{}.{ext}", f.nombre));
+                std::fs::write(&destino, bytes).map_err(|e| e.to_string())?;
+                Ok(destino)
+            })
+            .unwrap_or_else(|_| Err("fallo interno al generar la imagen".into()))
+        });
+        cx.spawn(async move |this, cx| {
+            let r = tarea.await;
+            let _ = this.update(cx, |this, cx| {
+                this.export_msg = Some(match r {
+                    Ok(p) => format!("Guardado: {}", p.display()),
+                    Err(e) => format!("No se pudo guardar: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Pestaña Figuras: lista, vista grande de la elegida y botones de descarga.
+    fn vista_figuras(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let figs = self.figuras().unwrap_or_default();
+        let sel = self.fig_sel.min(figs.len().saturating_sub(1));
+        let titulos = ["Concentración en el tramo", "Masa evacuada acumulada", "Dispersión D_L por sección", "Sensibilidad al pulso"];
+        let lista = v_flex().w(px(210.)).flex_none().gap_1p5().children(figs.iter().enumerate().map(|(i, _)| {
+            opcion(("fig", i), titulos.get(i).copied().unwrap_or("Figura").to_string(), i == sel, None).on_click(cx.listener(move |this, _, _, cx| {
+                this.fig_sel = i;
+                cx.notify();
+            }))
+        }));
+        let Some(f) = figs.get(sel).cloned() else { return div().flex_1().into_any_element() };
+        let leyenda: Vec<(String, u32)> = f.series.iter().filter(|s| !s.nombre.is_empty()).map(|s| (s.nombre.clone(), s.color)).collect();
+        let vista = tarjeta("Vista previa", leyenda, v_flex().gap_2().child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(f.titulo.clone())).child(grafica(f.series, f.marcas, f.ejes, 420.0)));
+        let botones = h_flex().gap_2().items_center()
+            .child(boton("g_png", "PNG", ACCENT).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "png", cx))))
+            .child(boton("g_svg", "SVG", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "svg", cx))))
+            .child(boton("g_pdf", "PDF", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "pdf", cx))))
+            .child(boton("g_todas", "Guardar las 4", RESET).on_click(cx.listener(|this, _, _, cx| this.exportar_figuras(cx))))
+            .children(self.export_msg.clone().map(|m| div().text_size(px(11.5)).text_color(rgb(MUTED)).child(m)));
+        v_flex()
+            .id("figuras")
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .gap_3()
+            .p_4()
+            .child(h_flex().gap_4().items_start().child(lista).child(v_flex().flex_1().min_w_0().gap_3().child(vista).child(botones)))
+            .into_any_element()
+    }
+
+    /// Pestaña Datos: tabla de las secciones del perfil elegido y avisos de lectura.
+    fn vista_datos(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let v = self.vista.as_ref().unwrap();
+        let p = &h.perfiles[self.perfil];
+        let d = &v.d[self.metodo];
+        let cols: [(&str, f32); 8] = [("Sección", 90.), ("Distancia (m)", 110.), ("Área (m²)", 100.), ("Ancho (m)", 100.), ("Perímetro (m)", 110.), ("Sf (m/m)", 100.), ("U (m/s)", 90.), ("D_L (m²/s)", 100.)];
+        let celda = |t: String, _w: f32, cab: bool| div().flex_1().min_w_0().text_size(px(12.)).text_color(rgb(if cab { MUTED } else { TEXT })).font_weight(if cab { FontWeight::SEMIBOLD } else { FontWeight::NORMAL }).child(t);
+        let mut tabla = v_flex().child(h_flex().h(px(32.)).items_center().px_3().bg(rgb(HEADER)).children(cols.iter().map(|(n, w)| celda(n.to_string(), *w, true))));
+        for i in 0..p.x.len() {
+            let fila = [
+                format!("{}", p.secciones[i]),
+                format!("{:.0}", p.x[i]),
+                format!("{:.1}", p.a[i]),
+                format!("{:.1}", p.b[i]),
+                format!("{:.1}", p.a[i] / p.r[i]),
+                format!("{:.5}", p.sf[i]),
+                format!("{:.2}", p.u[i]),
+                format!("{:.0}", d[i]),
+            ];
+            tabla = tabla.child(h_flex().h(px(30.)).items_center().px_3().border_t_1().border_color(rgb(BORDER)).children(fila.into_iter().zip(cols.iter()).map(|(t, (_, w))| celda(t, *w, false))));
+        }
+        let avisos = v_flex().gap_1().children(h.avisos.iter().map(|a| {
+            let c = match a.nivel { Nivel::Info => OK, Nivel::Aviso => WARN, Nivel::Error => ERR };
+            h_flex().gap_2().items_start().child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(rgb(c))).child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(a.mensaje.clone()))
+        }));
+        v_flex()
+            .id("datos")
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .gap_3()
+            .p_4()
+            .child(tarjeta("Secciones leídas", vec![], v_flex().child(tabla)))
+            .child(tarjeta("Avisos de los datos", vec![], avisos))
+    }
+
     /// Guarda las figuras actuales en una carpeta nueva (SVG, PNG a 300 ppp y PDF) sin bloquear la ventana.
     fn exportar_figuras(&mut self, cx: &mut Context<Self>) {
         let Some(figs) = self.figuras() else { return };
@@ -797,10 +935,10 @@ impl Riomat {
         }
         self.exportando = true;
         self.export_msg = Some("Exportando figuras…".into());
-        let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let base = Self::carpeta_export();
         let marca = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let nombre_perfil = self.hid.as_ref().map(|h| h.perfiles[self.perfil].nombre.replace(' ', "")).unwrap_or_default();
-        let dir = base.join("Documents").join("riomat-export").join(format!("{nombre_perfil}-{marca}"));
+        let dir = base.join(format!("{nombre_perfil}-{marca}"));
         let tarea = cx.background_executor().spawn(async move {
             let r = std::panic::catch_unwind(move || -> Result<usize, String> {
                 std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -813,7 +951,7 @@ impl Riomat {
                 Ok(figs.len())
             })
             .unwrap_or_else(|_| Err("fallo interno al generar las imágenes".into()));
-            (r, base.join("Documents").join("riomat-export"))
+            (r, Self::carpeta_export())
         });
         cx.spawn(async move |this, cx| {
             let (r, raiz) = tarea.await;
@@ -852,13 +990,12 @@ impl Riomat {
         .detach();
     }
 
-    fn panel_der(&self) -> impl IntoElement {
+    /// Verificación numérica y advertencias de datos (alimenta la insignia y el panel de verificación).
+    fn avisos_lista(&self) -> Vec<(Nivel, &'static str, String)> {
         let h = self.hid.as_ref().unwrap();
         let v = self.vista.as_ref().unwrap();
         let p = &h.perfiles[self.perfil];
         let res = self.actual().unwrap();
-        let (paso, _) = res.campo[self.frame];
-        let sec = (paso as f64 * res.dt) / 60.0;
         let (mut cour, mut pe) = (0.0_f64, 0.0_f64);
         let d = &v.d[self.metodo];
         for &x in &res.x {
@@ -891,6 +1028,17 @@ impl Riomat {
         if let Some(e) = &self.error {
             avisos.push((Nivel::Error, "Error", e.clone()));
         }
+        avisos
+    }
+
+    fn panel_der(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let h = self.hid.as_ref().unwrap();
+        let v = self.vista.as_ref().unwrap();
+        let p = &h.perfiles[self.perfil];
+        let res = self.actual().unwrap();
+        let (paso, _) = res.campo[self.frame];
+        let sec = (paso as f64 * res.dt) / 60.0;
+        let avisos = self.avisos_lista();
         let lista = v_flex().children(avisos.into_iter().map(|(n, comp, m)| {
             let c = match n {
                 Nivel::Info => OK,
@@ -910,10 +1058,9 @@ impl Riomat {
             .bg(rgb(PANEL))
             .border_l_1()
             .border_color(rgb(BORDER))
-            .child(div().px_4().h(px(40.)).flex().items_center().bg(rgb(HEADER)).text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Telemetría en vivo"))
+            .child(h_flex().px_4().h(px(40.)).items_center().justify_between().bg(rgb(HEADER)).child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Verificación")).child(div().id("cerrar_ver").cursor_pointer().text_color(rgb(MUTED)).child("✕").on_click(cx.listener(|this, _, _, cx| { this.ver_avisos = false; cx.notify(); }))))
             .child(
                 v_flex().px_4().py_2()
-                    .child(fila("Vista", "Resumen del sistema".into()))
                     .child(fila("Tiempo simulado", format!("{sec:.0} min")))
                     .child(fila("Caudal", format!("{:.2} m³/s", p.q)))
                     .child(fila("Masa inyectada", format!("{:.4}", res.inyectada[paso])))
@@ -922,7 +1069,6 @@ impl Riomat {
                     .child(fila("Concentración máx.", format!("{:.2e}", res.concentracion_max)))
                     .child(fila("Malla", format!("dx {:.2} m · dt {:.0} s", res.dx, res.dt))),
             )
-            .child(div().px_4().pt_3().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Registro de verificación y advertencias"))
-            .child(div().px_4().pb_4().child(lista))
+                        .child(div().px_4().pb_4().child(lista))
     }
 }

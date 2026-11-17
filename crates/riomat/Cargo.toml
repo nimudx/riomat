@@ -9,4 +9,10 @@ license.workspace = true
 gpui-kit.workspace = true
 riomat-core.workspace = true
 riomat-plot.workspace = true
+
+# Selector de archivos nativo: portal XDG en Linux, diálogo del sistema en Windows y macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.18.0" }

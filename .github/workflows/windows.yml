@@ -1,7 +1,12 @@
 name: Windows
 on:
   push:
+  pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -9,9 +14,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p riomat-core --release
-      - run: cargo build -p riomat --release
+      - name: Pruebas (los que necesitan datos de referencia se omiten)
+        run: cargo test --workspace --release
+      - name: Compilar
+        run: cargo build -p riomat --release
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\riomat.exe dist\riomat.exe
+          Copy-Item README.md dist\README.md
+          Compress-Archive -Path dist\* -DestinationPath riomat-windows.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: riomat-windows
-          path: target/release/riomat.exe
+          path: riomat-windows.zip
+      - name: Adjuntar al release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: riomat-windows.zip

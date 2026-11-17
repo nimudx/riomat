@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+rust-version = "1.88"
 
 [workspace.dependencies]
 riomat-core = { path = "crates/riomat-core" }
@@ -15,6 +16,7 @@ gpui-kit = "0.9.1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true
 
 # Las dependencias pesadas (render de imágenes, solver) van optimizadas también en debug
 [profile.dev.package."*"]
