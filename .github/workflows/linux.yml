@@ -1,0 +1,14 @@
+name: Linux
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  nucleo:
+    # Núcleo de cálculo y figuras: no necesitan librerías gráficas.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p riomat-core -p riomat-plot --release

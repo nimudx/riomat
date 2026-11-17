@@ -40,5 +40,14 @@ cargo test --workspace
 ```
 Compara los 9 escenarios y los 36 casos de sensibilidad con el CSV de Python (tolerancia relativa 1e-9) si existe `referencia/`.
 
+## Para colaboradores
+- Contexto, decisiones y pendientes: [`docs/CONTEXTO.md`](docs/CONTEXTO.md). Léelo antes de tocar el modelo.
+- No cambies las ecuaciones ni inventes datos; el núcleo se valida contra Python (`cargo test --workspace`).
+- En Windows: Rust (rustup), Build Tools de Visual Studio con «Desarrollo para el escritorio con C++», Git y drivers de GPU al día.
+  Clona en una ruta corta (`C:\dev\riomat`) y activa `git config --global core.longpaths true`. Para los tests con datos:
+  `$env:RIOMAT_REFERENCIA="C:\ruta\referencia"`.
+- Lo específico de un sistema operativo va con `#[cfg(target_os = "...")]` o en dependencias por plataforma; usa `PathBuf`.
+- Antes de subir: `cargo test --workspace` y `cargo build -p riomat --release`. GitHub Actions compila en Windows y prueba el núcleo en Linux.
+
 ## Alcance
 Trazador pasivo conservativo, no microplásticos. D_L viene de correlaciones empíricas sin calibrar y la duración del pulso es una hipótesis.
