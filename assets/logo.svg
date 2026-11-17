@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="fondo" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#1aa6ad"/>
+      <stop offset="0.55" stop-color="#0d6f86"/>
+      <stop offset="1" stop-color="#0a3a57"/>
+    </linearGradient>
+    <linearGradient id="traza" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd56b"/>
+      <stop offset="1" stop-color="#ec7a1c"/>
+    </linearGradient>
+    <clipPath id="marco"><rect width="256" height="256" rx="60"/></clipPath>
+  </defs>
+  <rect width="256" height="256" rx="60" fill="url(#fondo)"/>
+  <g clip-path="url(#marco)" fill="none" stroke="#ffffff" stroke-linecap="round">
+    <!-- curvas de nivel / líneas de corriente al fondo -->
+    <path d="M-20 214 C 50 188 104 236 170 206 S 260 196 290 210" stroke-opacity="0.10" stroke-width="3"/>
+    <path d="M-20 232 C 50 206 104 254 170 224 S 260 214 290 228" stroke-opacity="0.07" stroke-width="3"/>
+    <path d="M-20 196 C 50 170 104 218 170 188 S 260 178 290 192" stroke-opacity="0.07" stroke-width="3"/>
+  </g>
+  <g transform="translate(-20 4)">
+  <!-- R: tallo, panza y pierna que fluye como un río -->
+  <g fill="none" stroke="#ffffff" stroke-width="23" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M88 192 V 62 H 136 a 38 38 0 0 1 0 76 H 88"/>
+    <path d="M128 140 C 152 150 148 172 168 182 C 184 190 196 186 204 176"/>
+  </g>
+  <!-- gota de trazador y su onda -->
+  <circle cx="212" cy="166" r="23" fill="none" stroke="#ffd56b" stroke-opacity="0.38" stroke-width="3"/>
+  <circle cx="212" cy="166" r="34" fill="none" stroke="#ffd56b" stroke-opacity="0.16" stroke-width="3"/>
+  <circle cx="212" cy="166" r="14" fill="url(#traza)"/>
+  </g>
+</svg>

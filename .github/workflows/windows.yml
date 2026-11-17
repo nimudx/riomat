@@ -29,8 +29,23 @@ jobs:
         with:
           name: riomat-windows
           path: riomat-windows.zip
+      - name: Instalador (Inno Setup)
+        id: instalador
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" packaging\windows\riomat.iss
+      - uses: actions/upload-artifact@v4
+        if: steps.instalador.outcome == 'success'
+        with:
+          name: riomat-instalador
+          path: dist/Riomat-Setup-*.exe
       - name: Adjuntar al release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: riomat-windows.zip
+          files: |
+            riomat-windows.zip
+            dist/Riomat-Setup-*.exe

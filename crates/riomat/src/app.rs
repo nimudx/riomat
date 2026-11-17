@@ -1,4 +1,5 @@
 //! Estado y pantalla principal de Riomat (tema claro, esquema vivo del tramo + gráficas + telemetría).
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,6 +46,13 @@ enum Pestana {
     Datos,
     Sensibilidad,
     Auditoria,
+    Comparar,
+}
+
+/// Simulaciones de los tres caudales con la duración de pulso elegida, para compararlas.
+struct Comparacion {
+    sims: HashMap<(usize, usize), Resultado>, // (perfil, método)
+    d: HashMap<(usize, usize), Vec<f64>>,
 }
 
 struct Vista {
@@ -70,6 +78,7 @@ pub struct Riomat {
     fig_sel: usize,
     ver_avisos: bool,
     ancho: f32,
+    comp: Option<Comparacion>,
     sens: Option<Vec<analisis::FilaSens>>,
     sens_error: Option<String>,
     criticas: Vec<f64>,
@@ -97,7 +106,7 @@ impl Riomat {
         );
         let in_kd = campo("2".into(), "×", window, cx);
         let in_pa = campo("10".into(), "%", window, cx);
-        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, ancho: 1400.0, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
+        let mut s = Self { hid: None, archivos: vec![], error: None, perfil: 1, metodo: 1, dur: 1, vel: 0, frame: 4, playing: false, generacion: 0, vista: None, export_msg: None, exportando: false, pestana: Pestana::Simulacion, fig_sel: 0, ver_avisos: false, ancho: 1400.0, comp: None, sens: None, sens_error: None, criticas: vec![], in_kd, in_pa, durs: DURACIONES_BASE.to_vec(), par, in_masa, in_dur, in_dx, in_dt, in_tf };
         let rutas: Vec<PathBuf> = if !args.is_empty() { args } else { Self::buscar_por_defecto() };
         if !rutas.is_empty() {
             s.cargar(&rutas);
@@ -156,6 +165,7 @@ impl Riomat {
     }
 
     fn recalcular(&mut self) {
+        self.comp = None;
         let Some(h) = &self.hid else { return };
         let p = &h.perfiles[self.perfil];
         let mut sims = HashMap::new();
@@ -303,6 +313,59 @@ fn excels_en(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Fecha UTC (AAAA-MM-DD) sin dependencias externas.
+fn fecha_utc() -> String {
+    let dias = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86400).unwrap_or(0) as i64;
+    let z = dias + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Informe de una página: parámetros, los nueve escenarios, dos figuras y la verificación.
+#[allow(clippy::too_many_arguments)]
+fn armar_informe(h: &Hidraulica, par: &Parametros, esc: &[exportar::Escenario], figs: &[Figura], verif: &[exportar::Verificacion], archivos: &[String], perfil: &str, metodo: Metodo) -> riomat_plot::Informe {
+    let p0 = &h.perfiles[0];
+    let mut parametros = vec![
+        ("Programa".to_string(), format!("Riomat {}", env!("CARGO_PKG_VERSION"))),
+        ("Fecha (UTC)".into(), fecha_utc()),
+        ("Tramo".into(), format!("{:.0} m, {} secciones", p0.longitud(), p0.x.len())),
+        ("Caudales".into(), h.perfiles.iter().map(|p| format!("{} = {:.1}", p.nombre, p.q)).collect::<Vec<_>>().join(", ") + " m³/s"),
+        ("Datos".into(), if archivos.is_empty() { "-".into() } else { archivos.join(" + ") }),
+        ("Escenario mostrado".into(), format!("{perfil} · {}", metodo.nombre())),
+        ("Masa inyectada".into(), format!("{} (normalizada)", par.masa)),
+        ("Duración del pulso".into(), format!("{:.0} s (hipótesis)", par.duracion_pulso)),
+        ("Malla".into(), format!("dx ≤ {} m · dt = {} s", par.dx_max, par.dt)),
+        ("Tiempo simulado".into(), format!("{:.0} min", par.t_final / 60.0)),
+    ];
+    parametros.truncate(10);
+    let mut tabla = vec![vec!["Caudal (m³/s)".to_string(), "Correlación".into(), "t50 (min)".into(), "t95 (min)".into(), "Evacuado (%)".into(), "D_L mín–máx".into(), "Err. balance".into()]];
+    for e in esc {
+        let (dmin, dmax) = (e.d.iter().cloned().fold(f64::INFINITY, f64::min), e.d.iter().cloned().fold(0.0, f64::max));
+        tabla.push(vec![format!("{} ({:.1})", e.perfil, e.res.q), e.metodo.nombre().into(), fmt_min(e.res.t50_min).replace(" min", ""), fmt_min(e.res.t95_min).replace(" min", ""), format!("{:.2}", e.res.fraccion_salida * 100.0), format!("{dmin:.0}–{dmax:.0}"), format!("{:.0e}", e.res.error_balance)]);
+    }
+    let elegir = |n: &str| figs.iter().find(|f| f.nombre.starts_with(n)).cloned();
+    let figuras: Vec<Figura> = [elegir("comparacion_masa_evacuada").or_else(|| elegir("masa_evacuada")), elegir("mapa_espacio_tiempo")].into_iter().flatten().collect();
+    let mut avisos: Vec<String> = verif.iter().filter(|(n, _, _)| n != "info").map(|(_, c, m)| format!("{c}: {m}")).collect();
+    avisos.extend(verif.iter().filter(|(n, _, _)| n == "info").map(|(_, c, m)| format!("{c}: {m}")));
+    riomat_plot::Informe {
+        titulo: "Transporte 1D de un trazador pasivo · Puente Breña".into(),
+        subtitulo: "Río Mantaro · resultados exploratorios generados con Riomat a partir de la hidráulica de HEC-RAS".into(),
+        parametros,
+        tabla,
+        figuras,
+        avisos,
+        alcance: "Alcance: trazador pasivo conservativo (no modela deposición, resuspensión, flotación ni granulometría de microplásticos). D_L proviene de correlaciones empíricas sin calibrar; la masa y la duración del pulso son hipótesis, no mediciones.".into(),
+        pie: format!("Riomat {} · {} · ecuación: ∂(AC)/∂t + ∂(QC)/∂x = ∂/∂x(A·D·∂C/∂x), volúmenes finitos implícitos", env!("CARGO_PKG_VERSION"), fecha_utc()),
+    }
+}
+
 fn texto_num(v: f64) -> String {
     if (v - v.round()).abs() < 1e-9 { format!("{v:.0}") } else { format!("{v}") }
 }
@@ -375,25 +438,15 @@ fn boton(id: &'static str, texto: &'static str, color: u32) -> Stateful<Div> {
     div().id(id).h(px(28.)).px_4().flex().items_center().rounded_full().cursor_pointer().bg(rgb(color)).text_color(rgb(0xffffff)).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(texto)
 }
 
-/// Logotipo: perfil de río descendiendo, con el pulso como punto.
+/// Logotipo de Riomat (incrustado desde `assets/`): una R cuya pierna fluye como un río y termina en la gota de trazador.
 fn logo() -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        |b, _, window, _| {
-            let p = |x: f32, y: f32| point(b.origin.x + px(x), b.origin.y + px(y));
-            let mut pb = PathBuilder::stroke(px(2.2));
-            pb.move_to(p(1.0, 6.0));
-            pb.line_to(p(8.0, 7.0));
-            pb.line_to(p(12.0, 15.0));
-            pb.line_to(p(23.0, 17.0));
-            if let Ok(path) = pb.build() {
-                let c: Hsla = rgb(ACCENT).into();
-                window.paint_path(path, c);
-            }
-            window.paint_quad(fill(Bounds::new(p(5.0, 1.5), size(px(7.), px(7.))), rgb(TRAZ_MEDIO)).corner_radii(px(3.5)));
-        },
-    )
-    .size(px(24.))
+    logo_tam(28.0)
+}
+
+fn logo_tam(lado: f32) -> impl IntoElement {
+    static IMAGEN: std::sync::OnceLock<Arc<Image>> = std::sync::OnceLock::new();
+    let imagen = IMAGEN.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Png, include_bytes!("../../../assets/icon-128.png").to_vec()))).clone();
+    img(imagen).size(px(lado)).flex_none()
 }
 
 fn pastilla(texto: String) -> Div {
@@ -415,12 +468,16 @@ impl Render for Riomat {
         if self.hid.is_none() || self.vista.is_none() {
             return raiz.child(self.vacio(cx));
         }
+        if self.pestana == Pestana::Comparar && self.comp.is_none() {
+            self.calcular_comp();
+        }
         let centro = match self.pestana {
             Pestana::Simulacion => self.centro(cx).into_any_element(),
             Pestana::Figuras => self.vista_figuras(cx).into_any_element(),
             Pestana::Datos => self.vista_datos(cx).into_any_element(),
             Pestana::Sensibilidad => self.vista_sensibilidad(cx).into_any_element(),
             Pestana::Auditoria => self.vista_auditoria(cx).into_any_element(),
+            Pestana::Comparar => self.vista_comparar(cx).into_any_element(),
         };
         let cuerpo = h_flex().flex_1().min_h_0().child(self.panel_izq(cx)).child(centro);
         let cuerpo = if self.ver_avisos { cuerpo.child(self.panel_der(cx)) } else { cuerpo };
@@ -435,7 +492,7 @@ impl Riomat {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(h_flex().gap_3().items_center().child(logo()).child(div().text_size(px(32.)).font_weight(FontWeight::SEMIBOLD).child("riomat")))
+            .child(h_flex().gap_3().items_center().child(logo_tam(56.)).child(div().text_size(px(32.)).font_weight(FontWeight::SEMIBOLD).child("riomat")))
             .child(div().text_color(rgb(MUTED)).child("Del resultado de HEC-RAS al transporte de un pulso, sin preparar Excel"))
             .child(
                 v_flex().gap_1().max_w(px(560.)).p_4().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER))
@@ -472,7 +529,7 @@ impl Riomat {
             this.vel = (this.vel + 1) % VELOCIDADES.len();
             cx.notify();
         }));
-        let simulando = self.pestana == Pestana::Simulacion;
+        let simulando = matches!(self.pestana, Pestana::Simulacion | Pestana::Comparar);
         let avisos = self.avisos_lista();
         let n_av = avisos.iter().filter(|(n, _, _)| !matches!(n, Nivel::Info)).count();
         let insignia = h_flex()
@@ -492,7 +549,7 @@ impl Riomat {
                 this.ver_avisos = !this.ver_avisos;
                 cx.notify();
             }));
-        let pestanas = h_flex().gap_1().children([(Pestana::Simulacion, "Simulación"), (Pestana::Figuras, "Figuras"), (Pestana::Datos, "Datos"), (Pestana::Sensibilidad, "Sensibilidad"), (Pestana::Auditoria, "Auditoría D_L")].into_iter().enumerate().map(|(i, (p, t))| {
+        let pestanas = h_flex().gap_1().children([(Pestana::Simulacion, "Simulación"), (Pestana::Figuras, "Figuras"), (Pestana::Datos, "Datos"), (Pestana::Comparar, "Comparar"), (Pestana::Sensibilidad, "Sensibilidad"), (Pestana::Auditoria, "Auditoría D_L")].into_iter().enumerate().map(|(i, (p, t))| {
             let activa = self.pestana == p;
             div().id(("pest", i)).h(px(48.)).px_3().flex().items_center().cursor_pointer().text_size(px(13.)).font_weight(if activa { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .text_color(rgb(if activa { ACCENT } else { MUTED })).border_b_2().border_color(if activa { rgb(ACCENT) } else { rgb(PANEL) }).child(t)
@@ -500,6 +557,9 @@ impl Riomat {
                     this.pestana = p;
                     if p == Pestana::Sensibilidad && this.sens.is_none() {
                         this.calcular_sens(cx);
+                    }
+                    if p == Pestana::Comparar && this.comp.is_none() {
+                        this.calcular_comp();
                     }
                     cx.notify();
                 }))
@@ -540,6 +600,8 @@ impl Riomat {
             let dv = *d;
             durs = durs.child(opcion(("d", i), etiqueta_duracion(dv), i == self.dur, None).on_click(cx.listener(move |this, _, window, cx| {
                 this.dur = i;
+                this.comp = None;
+                this.sens = None;
                 this.frame = this.frame.min(this.n_frames().saturating_sub(1));
                 this.poner(&this.in_dur.clone(), texto_num(dv), window, cx);
                 cx.notify();
@@ -793,6 +855,7 @@ impl Riomat {
         let pts: Vec<(f64, f64)> = res.x.iter().zip(&res.campo[self.frame].1).map(|(x, c)| (x / 1000.0, c * 1e6)).collect();
         let xmax = res.x.last().copied().unwrap_or(1.0) / 1000.0;
         figs.push(Figura {
+            mapa: None,
             nombre: format!("concentracion_t{:.0}min", t_min),
             titulo: format!("Concentración a t = {t_min:.0} min · {contexto}"),
             series: vec![s(metodo.nombre(), pts, col, 2.2, true, true)],
@@ -809,6 +872,7 @@ impl Riomat {
         }
         let tfin = res.t.last().copied().unwrap_or(1.0) / 60.0;
         figs.push(Figura {
+            mapa: None,
             nombre: "masa_evacuada".into(),
             titulo: format!("Masa evacuada acumulada · {} · Q = {:.1} m³/s · pulso de {}", p.nombre, p.q, etiqueta_duracion(self.durs[self.dur])),
             series: series2,
@@ -828,6 +892,7 @@ impl Riomat {
         let lmax = p.x.last().copied().unwrap_or(1.0) / 1000.0;
         let series3: Vec<Serie> = METODOS.iter().enumerate().map(|(mi, m)| s(m.nombre(), p.x.iter().map(|x| x / 1000.0).zip(v.d[mi].iter().cloned()).collect(), color_metodo(*m), if mi == self.metodo { 2.6 } else { 1.4 }, false, mi == self.metodo)).collect();
         figs.push(Figura {
+            mapa: None,
             nombre: "dispersion_DL".into(),
             titulo: format!("Coeficiente de dispersión D_L por sección · {} · Q = {:.1} m³/s", p.nombre, p.q),
             series: series3,
@@ -851,6 +916,7 @@ impl Riomat {
         }
         let ytop4 = techo_bonito(tmax * 1.05);
         figs.push(Figura {
+            mapa: None,
             nombre: "sensibilidad_pulso".into(),
             titulo: format!("Sensibilidad a la duración del pulso · {} · Q = {:.1} m³/s", p.nombre, p.q),
             series: series4,
@@ -865,9 +931,114 @@ impl Riomat {
         base.join("Documents").join("riomat-export")
     }
 
+    /// Mapa espacio-tiempo: color = concentración (escala √ para ver la cola del pulso). Se simula con un fotograma por minuto
+    /// y el eje de tiempo se recorta a ~1.4 × t95 (después ya no queda trazador en el tramo).
+    fn figura_mapa(&self) -> Option<Figura> {
+        let h = self.hid.as_ref()?;
+        let v = self.vista.as_ref()?;
+        let p = &h.perfiles[self.perfil];
+        let metodo = METODOS[self.metodo];
+        let par = Parametros { duracion_pulso: self.durs[self.dur], campo_cada: Some(((60.0 / self.par.dt).round() as usize).max(1)), ..self.par.clone() };
+        let res = simular_entrada(p.q, &p.x, &p.a, &v.d[self.metodo], &par).ok()?;
+        let corte = self.actual()?.t95_min.map(|t| t * 1.4 * 60.0).unwrap_or(f64::INFINITY);
+        let frames: Vec<&(usize, Vec<f64>)> = res.campo.iter().filter(|(paso, _)| (*paso as f64 * res.dt) <= corte).collect();
+        if frames.len() < 2 {
+            return None;
+        }
+        let nxm = res.x.len().min(160);
+        let cmax = res.concentracion_max.max(1e-300);
+        let mut colores = Vec::with_capacity(nxm * frames.len());
+        for (_, c) in &frames {
+            for k in 0..nxm {
+                let i = (((k as f64 + 0.5) * res.x.len() as f64 / nxm as f64) as usize).min(c.len() - 1);
+                colores.push(rampa((c[i] / cmax).max(0.0).sqrt()));
+            }
+        }
+        let tfin_m = frames.last().map(|(p, _)| *p as f64 * res.dt / 60.0).unwrap_or(1.0).max(1.0);
+        let xmax = res.x.last().copied().unwrap_or(1.0) / 1000.0;
+        Some(Figura {
+            nombre: "mapa_espacio_tiempo".into(),
+            titulo: format!("Mapa espacio-tiempo de la concentración · {} · Q = {:.1} m³/s · {} · pulso de {}", p.nombre, p.q, metodo.nombre(), etiqueta_duracion(self.durs[self.dur])),
+            series: vec![],
+            marcas: vec![],
+            mapa: Some(riomat_plot::Mapa {
+                nx: nxm,
+                ny: frames.len(),
+                colores,
+                barra: (0..24).map(|k| rampa(k as f64 / 23.0)).collect(),
+                barra_max: format!("{:.1} ×10⁻⁶", cmax * 1e6),
+                barra_titulo: "Color ∝ √C (masa/m³)".into(),
+            }),
+            ejes: Ejes { x: (0.0, xmax), y: (0.0, tfin_m), x_log: false, y_log: false, x_ticks: ticks_lineales(0.0, xmax, 6), y_ticks: ticks_lineales(0.0, tfin_m, 5), x_titulo: "Distancia aguas abajo (km)".into(), y_titulo: "Tiempo (min)".into() },
+        })
+    }
+
+    /// Todas las figuras exportables: las cinco de la pestaña Figuras y las tres de la comparación.
+    fn todas_las_figuras(&mut self) -> Option<Vec<Figura>> {
+        if self.comp.is_none() {
+            self.calcular_comp();
+        }
+        let mut f = self.figuras_con_mapa()?;
+        f.extend(self.figuras_comparar().unwrap_or_default());
+        Some(f)
+    }
+
+    /// Genera el informe PDF de una página en `~/Documents/riomat-export/`. Corre en segundo plano.
+    fn exportar_informe(&mut self, cx: &mut Context<Self>) {
+        let (Some(figs), Some(h)) = (self.todas_las_figuras(), self.hid.clone()) else { return };
+        if self.exportando {
+            return;
+        }
+        self.exportando = true;
+        self.export_msg = Some("Generando informe…".into());
+        let par = Parametros { duracion_pulso: self.durs[self.dur], campo_cada: None, ..self.par.clone() };
+        let (perfil, metodo, archivos) = (h.perfiles[self.perfil].nombre.clone(), METODOS[self.metodo], self.archivos.clone());
+        let verif = self.verificacion_texto();
+        let marca = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let ruta = Self::carpeta_export().join(format!("informe-{marca}.pdf"));
+        let tarea = cx.background_executor().spawn(async move {
+            let r = ruta.clone();
+            let res = std::panic::catch_unwind(move || -> Result<(), String> {
+                let esc = exportar::escenarios(&h, &par)?;
+                let inf = armar_informe(&h, &par, &esc, &figs, &verif, &archivos, &perfil, metodo);
+                let pdf = riomat_plot::svg_a_pdf(&riomat_plot::informe_svg(&inf))?;
+                if let Some(d) = r.parent() {
+                    std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+                }
+                std::fs::write(&r, pdf).map_err(|e| format!("{}: {e}", r.display()))
+            })
+            .unwrap_or_else(|_| Err("fallo interno al generar el informe".into()));
+            (res, ruta)
+        });
+        cx.spawn(async move |this, cx| {
+            let (r, ruta) = tarea.await;
+            let _ = this.update(cx, |this, cx| {
+                this.exportando = false;
+                this.export_msg = Some(match r {
+                    Ok(()) => format!("Informe guardado: {}", ruta.display()),
+                    Err(e) => format!("No se pudo generar el informe: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn verificacion_texto(&self) -> Vec<exportar::Verificacion> {
+        self.avisos_lista().into_iter().map(|(n, c, m)| (match n { Nivel::Info => "info", Nivel::Aviso => "aviso", Nivel::Error => "error" }.to_string(), c.to_string(), m)).collect()
+    }
+
+    /// Las figuras de la pestaña Figuras: las cuatro gráficas y el mapa espacio-tiempo.
+    fn figuras_con_mapa(&self) -> Option<Vec<Figura>> {
+        let mut f = self.figuras()?;
+        f.extend(self.figura_mapa());
+        Some(f)
+    }
+
     /// Guarda una sola figura (`formato`: "png", "svg" o "pdf") en la carpeta de exportación, sin bloquear la ventana.
     fn guardar_figura(&mut self, idx: usize, formato: &'static str, cx: &mut Context<Self>) {
-        let Some(f) = self.figuras().and_then(|v| v.into_iter().nth(idx)) else { return };
+        let Some(f) = self.figuras_con_mapa().and_then(|v| v.into_iter().nth(idx)) else { return };
         let raiz = Self::carpeta_export();
         self.export_msg = Some("Guardando…".into());
         let tarea = cx.background_executor().spawn(async move {
@@ -901,9 +1072,9 @@ impl Riomat {
 
     /// Pestaña Figuras: lista, vista grande de la elegida y botones de descarga.
     fn vista_figuras(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let figs = self.figuras().unwrap_or_default();
+        let figs = self.figuras_con_mapa().unwrap_or_default();
         let sel = self.fig_sel.min(figs.len().saturating_sub(1));
-        let titulos = ["Concentración en el tramo", "Masa evacuada acumulada", "Dispersión D_L por sección", "Sensibilidad al pulso"];
+        let titulos = ["Concentración en el tramo", "Masa evacuada acumulada", "Dispersión D_L por sección", "Sensibilidad al pulso", "Mapa espacio-tiempo"];
         let lista = v_flex().w(px(210.)).flex_none().gap_1p5().children(figs.iter().enumerate().map(|(i, _)| {
             opcion(("fig", i), titulos.get(i).copied().unwrap_or("Figura").to_string(), i == sel, None).on_click(cx.listener(move |this, _, _, cx| {
                 this.fig_sel = i;
@@ -912,11 +1083,12 @@ impl Riomat {
         }));
         let Some(f) = figs.get(sel).cloned() else { return div().flex_1().into_any_element() };
         let leyenda: Vec<(String, u32)> = f.series.iter().filter(|s| !s.nombre.is_empty()).map(|s| (s.nombre.clone(), s.color)).collect();
-        let vista = tarjeta("Vista previa", leyenda, v_flex().gap_2().child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(f.titulo.clone())).child(grafica(f.series, f.marcas, f.ejes, 420.0)));
+        let vista = tarjeta("Vista previa", leyenda, v_flex().gap_2().child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(f.titulo.clone())).child(if f.mapa.is_some() { mapa_calor(f.clone(), 420.0).into_any_element() } else { grafica(f.series, f.marcas, f.ejes, 420.0).into_any_element() }));
         let botones = h_flex().gap_2().items_center()
             .child(boton("g_png", "PNG", ACCENT).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "png", cx))))
             .child(boton("g_svg", "SVG", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "svg", cx))))
             .child(boton("g_pdf", "PDF", RESET).on_click(cx.listener(move |this, _, _, cx| this.guardar_figura(sel, "pdf", cx))))
+            .child(boton("g_informe", "Informe PDF", ACCENT).on_click(cx.listener(|this, _, _, cx| this.exportar_informe(cx))))
             .child(boton("g_todo", "Exportar todo", ACCENT).on_click(cx.listener(|this, _, _, cx| this.exportar_todo(cx))))
             .children(self.export_msg.clone().map(|m| div().text_size(px(11.5)).text_color(rgb(MUTED)).child(m)));
         v_flex()
@@ -958,6 +1130,140 @@ impl Riomat {
             }
         }
         cx.notify();
+    }
+
+    /// Simula los tres caudales × tres correlaciones con la duración de pulso elegida.
+    fn calcular_comp(&mut self) {
+        let Some(h) = &self.hid else { return };
+        let par = Parametros { duracion_pulso: self.durs[self.dur], campo_cada: Some(CAMPO_CADA), ..self.par.clone() };
+        let (mut sims, mut d) = (HashMap::new(), HashMap::new());
+        for (pi, p) in h.perfiles.iter().enumerate() {
+            for (mi, m) in METODOS.iter().enumerate() {
+                let dl = coeficientes(*m, &p.u, &p.a, &p.b, &p.r, &p.sf);
+                match simular_entrada(p.q, &p.x, &p.a, &dl, &par) {
+                    Ok(r) => {
+                        sims.insert((pi, mi), r);
+                        d.insert((pi, mi), dl);
+                    }
+                    Err(e) => self.error = Some(format!("{} / {}: {e}", p.nombre, m.nombre())),
+                }
+            }
+        }
+        self.comp = Some(Comparacion { sims, d });
+    }
+
+    /// Figuras de la comparación entre caudales para la correlación elegida (misma fuente para pantalla y exportación).
+    fn figuras_comparar(&self) -> Option<Vec<Figura>> {
+        let h = self.hid.as_ref()?;
+        let c = self.comp.as_ref()?;
+        let m = METODOS[self.metodo];
+        let tono = [0x8bb6d9_u32, 0x3f7fbf, 0x14325e];
+        let s = |n: String, puntos: Vec<(f64, f64)>, color: u32| Serie { nombre: n, puntos, color, grosor: 2.4, relleno: false, opaca: true };
+        let ctx = format!("{} · pulso de {}", m.nombre(), etiqueta_duracion(self.durs[self.dur]));
+        let nombre = |pi: usize| format!("{} ({:.1} m³/s)", h.perfiles[pi].nombre, h.perfiles[pi].q);
+        let mut figs = Vec::new();
+
+        // 1) Masa evacuada
+        let mut s1 = vec![];
+        let mut tfin = 1.0_f64;
+        for pi in 0..h.perfiles.len() {
+            let r = c.sims.get(&(pi, self.metodo))?;
+            tfin = tfin.max(r.t.last().copied().unwrap_or(1.0) / 60.0);
+            s1.push(s(nombre(pi), (0..r.t.len()).step_by(4).map(|j| (r.t[j] / 60.0, r.salida[j] / r.masa)).collect(), tono[pi % 3]));
+        }
+        figs.push(Figura {
+            mapa: None,
+            nombre: "comparacion_masa_evacuada".into(),
+            titulo: format!("Masa evacuada acumulada por caudal · {ctx}"),
+            series: s1, marcas: vec![],
+            ejes: Ejes { x: (0.0, tfin), y: (0.0, 1.0), x_log: false, y_log: false, x_ticks: ticks_lineales(0.0, tfin, 5), y_ticks: ticks_lineales(0.0, 1.0, 5), x_titulo: "Tiempo (min)".into(), y_titulo: "Fracción evacuada".into() },
+        });
+
+        // 2) Concentración a lo largo del tramo en el mismo instante
+        let mut s2 = vec![];
+        let (mut ymax, mut xmax, mut t_min) = (0.0_f64, 1.0_f64, 0.0_f64);
+        for pi in 0..h.perfiles.len() {
+            let r = c.sims.get(&(pi, self.metodo))?;
+            let f = self.frame.min(r.campo.len().saturating_sub(1));
+            let (paso, cc) = &r.campo[f];
+            t_min = *paso as f64 * r.dt / 60.0;
+            xmax = xmax.max(r.x.last().copied().unwrap_or(1.0) / 1000.0);
+            let pts: Vec<(f64, f64)> = r.x.iter().zip(cc).map(|(x, v)| (x / 1000.0, v * 1e6)).collect();
+            ymax = pts.iter().fold(ymax, |m, p| m.max(p.1));
+            s2.push(s(nombre(pi), pts, tono[pi % 3]));
+        }
+        if ymax < 1e-9 {
+            ymax = c.sims.values().map(|r| r.concentracion_max * 1e6).fold(0.0, f64::max);
+        }
+        let ytop = techo_bonito((ymax * 1.1).max(1e-6));
+        figs.push(Figura {
+            mapa: None,
+            nombre: format!("comparacion_concentracion_t{:.0}min", t_min),
+            titulo: format!("Concentración a t = {t_min:.0} min por caudal · {ctx}"),
+            series: s2, marcas: vec![],
+            ejes: Ejes { x: (0.0, xmax), y: (0.0, ytop), x_log: false, y_log: false, x_ticks: ticks_lineales(0.0, xmax, 6), y_ticks: ticks_lineales(0.0, ytop, 5), x_titulo: "Distancia aguas abajo (km)".into(), y_titulo: "Concentración (×10⁻⁶ masa/m³)".into() },
+        });
+
+        // 3) D_L por sección
+        let mut s3 = vec![];
+        let (mut lo, mut hi) = (f64::INFINITY, 0.0_f64);
+        for (pi, p) in h.perfiles.iter().enumerate() {
+            let d = c.d.get(&(pi, self.metodo))?;
+            lo = d.iter().fold(lo, |m, v| m.min(*v));
+            hi = d.iter().fold(hi, |m, v| m.max(*v));
+            s3.push(s(nombre(pi), p.x.iter().map(|x| x / 1000.0).zip(d.iter().cloned()).collect(), tono[pi % 3]));
+        }
+        let (k0, k1) = (lo.log10().floor() as i32, hi.log10().ceil() as i32);
+        let lmax = h.perfiles[0].x.last().copied().unwrap_or(1.0) / 1000.0;
+        figs.push(Figura {
+            mapa: None,
+            nombre: "comparacion_dispersion_DL".into(),
+            titulo: format!("D_L por sección y caudal · {}", m.nombre()),
+            series: s3, marcas: vec![],
+            ejes: Ejes { x: (0.0, lmax), y: (10f64.powi(k0), 10f64.powi(k1)), x_log: false, y_log: true, x_ticks: ticks_lineales(0.0, lmax, 6), y_ticks: (k0..=k1).map(|k| 10f64.powi(k)).collect(), x_titulo: "Distancia aguas abajo (km)".into(), y_titulo: "D_L (m²/s)".into() },
+        });
+        Some(figs)
+    }
+
+    /// Pestaña Comparar: los tres caudales en una sola pantalla, con la correlación y el pulso elegidos.
+    fn vista_comparar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let base = v_flex().id("comp").flex_1().h_full().min_w_0().overflow_y_scroll().gap_3().p_4();
+        let (Some(h), Some(c), Some(figs)) = (self.hid.as_ref(), self.comp.as_ref(), self.figuras_comparar()) else {
+            return base.child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("Calculando…")).into_any_element();
+        };
+        let m = METODOS[self.metodo];
+        let tono = [0x8bb6d9_u32, 0x3f7fbf, 0x14325e];
+        // Una cifra por caudal
+        let cartas = h_flex().flex_none().gap_3().children(h.perfiles.iter().enumerate().map(|(pi, p)| {
+            let r = &c.sims[&(pi, self.metodo)];
+            let d = &c.d[&(pi, self.metodo)];
+            let (dmin, dmax) = (d.iter().cloned().fold(f64::INFINITY, f64::min), d.iter().cloned().fold(0.0, f64::max));
+            v_flex().flex_1().min_w_0().gap_1().px_3().py_2().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER))
+                .child(h_flex().gap_2().items_center().child(div().size(px(10.)).rounded_sm().bg(rgb(tono[pi % 3]))).child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child(format!("{} · {:.1} m³/s", p.nombre, p.q))))
+                .child(div().text_size(px(21.)).font_weight(FontWeight::SEMIBOLD).child(format!("t50 {}", fmt_min(r.t50_min))))
+                .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child(format!("t95 {} · D_L {dmin:.0}–{dmax:.0} m²/s · evacuado {:.1} %", fmt_min(r.t95_min), r.fraccion_salida * 100.0)))
+        }));
+        let leyenda: Vec<(String, u32)> = h.perfiles.iter().enumerate().map(|(pi, p)| (format!("{} ({:.1} m³/s)", p.nombre, p.q), tono[pi % 3])).collect();
+        let dib = |i: usize| {
+            let f = figs[i].clone();
+            grafica(f.series, f.marcas, f.ejes, 260.0)
+        };
+        // Tabla de los nueve escenarios
+        let filas: Vec<Vec<String>> = h.perfiles.iter().enumerate().flat_map(|(pi, p)| {
+            METODOS.iter().enumerate().map(move |(mi, mm)| (pi, p, mi, mm))
+        }).map(|(pi, p, mi, mm)| {
+            let r = &c.sims[&(pi, mi)];
+            vec![format!("{} ({:.1})", p.nombre, p.q), mm.nombre().to_string(), fmt_min(r.t50_min), fmt_min(r.t95_min), format!("{:.2} %", r.fraccion_salida * 100.0)]
+        }).collect();
+        base
+            .child(div().text_size(px(12.5)).text_color(rgb(MUTED)).child(format!("Correlación: {} · pulso de {} · instante {:.0} min (barra de la pestaña Simulación)", m.nombre(), etiqueta_duracion(self.durs[self.dur]), c.sims[&(0, self.metodo)].campo[self.frame.min(c.sims[&(0, self.metodo)].campo.len() - 1)].0 as f64 * c.sims[&(0, self.metodo)].dt / 60.0)))
+            .child(cartas)
+            .child(h_flex().flex_none().gap_3().items_start()
+                .child(div().flex_1().min_w_0().child(tarjeta("Masa evacuada acumulada", leyenda.clone(), dib(0))))
+                .child(div().flex_1().min_w_0().child(tarjeta("Concentración en el tramo", leyenda.clone(), dib(1)))))
+            .child(tarjeta("Dispersión D_L por sección", leyenda, dib(2)))
+            .child(tarjeta("Los nueve escenarios (min)", vec![], tabla_txt(&["Caudal (m³/s)", "Correlación", "t50", "t95", "Evacuado"], filas)))
+            .into_any_element()
     }
 
     /// Pestaña Sensibilidad: ensayos sobre D_L y el área de las secciones críticas.
@@ -1070,7 +1376,7 @@ impl Riomat {
 
     /// Exporta todo a una carpeta nueva: CSV, Excel, figuras (SVG, PNG y PDF) y el script de matplotlib. Corre en segundo plano.
     fn exportar_todo(&mut self, cx: &mut Context<Self>) {
-        let (Some(figs), Some(h), Some(res)) = (self.figuras(), self.hid.clone(), self.actual().cloned()) else { return };
+        let (Some(figs), Some(h), Some(res)) = (self.todas_las_figuras(), self.hid.clone(), self.actual().cloned()) else { return };
         if self.exportando {
             return;
         }
@@ -1095,6 +1401,9 @@ impl Riomat {
                 let sens = analisis::sensibilidad(&h, &par, &analisis::ensayos(if kd > 1.0 { kd } else { 2.0 }, if pa > 0.0 && pa < 100.0 { pa } else { 10.0 }), &criticas)?;
                 let aud = analisis::auditoria(&h, &criticas);
                 let mut n = exportar::escribir(&d, &h, &par, &esc, &m, &verif, exportar::tablas_analisis(&sens, &aud))?.len();
+                let inf = armar_informe(&h, &par, &esc, &figs, &verif, &archivos, &perfil, metodo);
+                std::fs::write(d.join("informe.pdf"), riomat_plot::svg_a_pdf(&riomat_plot::informe_svg(&inf))?).map_err(|e| e.to_string())?;
+                n += 1;
                 let fdir = d.join("figuras");
                 std::fs::create_dir_all(&fdir).map_err(|e| format!("{}: {e}", fdir.display()))?;
                 for f in &figs {

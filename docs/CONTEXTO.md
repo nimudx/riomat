@@ -28,19 +28,23 @@ Los datos de referencia (Excel y CSV) **no se versionan**: carpeta `referencia/`
 - `riomat`: interfaz GPUI. Pestañas Simulación / Figuras / Datos; insignia de verificación; panel de parámetros con botón Calcular.
 - HEC-RAS: las distancias corren desde aguas abajo; el modelo corre desde aguas arriba (x = s0 − sección).
 
+## Identidad y empaquetado
+Logo: R sólida cuya pierna fluye como un río y termina en una gota ámbar de trazador con ondas, sobre fondo de agua (`assets/logo.svg`). Reemplazó al logo anterior (perfil de río con punto), que no gustó.
+Iconos con `scripts/generar-iconos.sh`; instalación Linux con `scripts/install-linux.sh` (+ `packaging/linux/riomat.desktop`); Windows: icono incrustado por `build.rs` (winresource) e instalador Inno Setup (`packaging/windows/riomat.iss`), ambos **sin probar en Windows**.
+
 ## Decisiones de diseño
 Tema claro piedra/agua; el trazador es el único color cálido; perfil longitudinal real del río con agua teñida por la concentración.
 Poco texto en pantalla: la verificación vive en una insignia (✓ / ⚠ N) que abre un panel. Identidad propia, no copia de R-THYM.
 
 ## Hecho
 Núcleo validado · entrada por tabla de HEC-RAS (pegar, abrir, arrastrar) · parámetros editables + Calcular ·
-exportación de figuras PNG/SVG/PDF (una o las 4) · **Exportar todo** (CSV + Excel + figuras + `graficar_matplotlib.py` en `~/Documents/riomat-export/riomat-<marca>/`, módulo `riomat-core/src/exportar.rs`) · selector de archivos · pestañas · flujos de Windows y Linux en GitHub.
+exportación de figuras PNG/SVG/PDF (una o las 4) · **Mapa espacio-tiempo** (pestaña Figuras; simula a 1 fotograma/min y recorta a ~1.4×t95; color ∝ √C) · **Exportar todo** (CSV + Excel + figuras + `informe.pdf` + `graficar_matplotlib.py` en `~/Documents/riomat-export/riomat-<marca>/`, módulo `riomat-core/src/exportar.rs`) · selector de archivos · pestañas · flujos de Windows y Linux en GitHub.
 
 ## Pendiente (orden propuesto)
-1. ~~Exportar todo~~ (hecho; falta informe PDF de una página con parámetros, tablas y avisos).
+1. ~~Exportar todo~~ (hecho; incluye `informe.pdf` de una página A4: parámetros, 9 escenarios, 2 figuras y verificación; también botón «Informe PDF»).
 2. ~~Sensibilidad y auditoría de D_L~~ (hecho: `riomat-core/src/analisis.rs`, pestañas Sensibilidad y Auditoría D_L, validado contra Python a 1e-9;
    factores y secciones críticas editables; sale en Exportar todo). Origen: `04_Codigo_Python` (sus rutas `/mnt/data` están rotas).
-3. **Comparar los tres caudales** en una pantalla; mapa espacio-tiempo en Figuras.
+3. ~~Comparar los tres caudales~~ (hecho: pestaña Comparar, sus 3 figuras salen en Exportar todo). 
 4. Probar con una **tabla real de HEC-RAS** (hasta ahora solo con tablas armadas desde los Excel); `.hdf`/`.O01` sin soporte.
 5. Convergencia en malla y tiempo con la condición de entrada nueva.
 6. Verificar el build en Windows (el flujo de Actions nunca se ha visto en verde).

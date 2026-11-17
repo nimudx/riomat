@@ -1,1 +1,0 @@
-fn main(){let s=std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();println!("{:?}",riomat_plot::svg_a_png(&s,3.0).map(|v|v.len()));println!("{:?}",riomat_plot::svg_a_pdf(&s).map(|v|v.len()));}

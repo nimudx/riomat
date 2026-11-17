@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Riomat
+GenericName=Transporte de trazadores en ríos
+Comment=Simulador 1D de transporte de un trazador a partir de resultados de HEC-RAS
+Comment[en]=1D tracer transport simulator from HEC-RAS results
+Exec=riomat %F
+Icon=riomat
+Terminal=false
+Categories=Science;Engineering;
+Keywords=HEC-RAS;rio;trazador;dispersion;hidraulica;
+StartupWMClass=riomat

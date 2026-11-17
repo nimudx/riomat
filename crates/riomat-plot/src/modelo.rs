@@ -29,6 +29,19 @@ pub struct Ejes {
     pub y_titulo: String,
 }
 
+/// Mapa de calor (p. ej. espacio-tiempo): una celda de color por (columna, fila); la fila 0 es el valor menor del eje Y.
+#[derive(Clone, Debug)]
+pub struct Mapa {
+    pub nx: usize,
+    pub ny: usize,
+    /// `ny * nx` colores 0xRRGGBB, fila a fila desde el valor menor de Y.
+    pub colores: Vec<u32>,
+    /// Colores de la barra, del valor menor al mayor.
+    pub barra: Vec<u32>,
+    pub barra_max: String,
+    pub barra_titulo: String,
+}
+
 /// Una figura completa, lista para dibujar en pantalla o exportar.
 #[derive(Clone, Debug)]
 pub struct Figura {
@@ -38,6 +51,8 @@ pub struct Figura {
     pub series: Vec<Serie>,
     pub marcas: Vec<Marca>,
     pub ejes: Ejes,
+    /// Si existe, la figura es un mapa de calor y se ignoran las series.
+    pub mapa: Option<Mapa>,
 }
 
 /// Formato compacto de un número de eje.

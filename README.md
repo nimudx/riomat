@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon-128.png" alt="Riomat" width="96"></p>
+
 # Riomat
 
 Simulador 1D de transporte de un trazador pasivo en un tramo de río, a partir de los datos hidráulicos de HEC-RAS.
@@ -28,6 +30,21 @@ Experimental: `scripts/cross-windows.sh` intenta compilar el `.exe` desde Linux 
 
 El código de cálculo (`riomat-core`) y de figuras (`riomat-plot`) no depende del sistema operativo. Lo específico
 está aislado en `crates/riomat/Cargo.toml` (selector de archivos) y `main.rs` (sin consola en Windows).
+
+## Instalar
+**Linux** (usuario, sin sudo; deja `riomat` en `~/.local/bin` y la entrada «Riomat» con su icono en el menú):
+```sh
+scripts/install-linux.sh                  # compila e instala
+sudo PREFIX=/usr/local scripts/install-linux.sh   # para todo el sistema
+scripts/install-linux.sh --desinstalar
+```
+**Windows**: descarga el instalador `Riomat-Setup-<versión>.exe` (artefacto `riomat-instalador` del flujo de GitHub, o del Release)
+o el zip portátil `riomat-windows.zip`. El instalador crea el acceso del menú Inicio y, si quieres, del escritorio; no pide permisos
+de administrador. Para generarlo a mano: compila en release y ejecuta `iscc /DAppVersion=0.1.0 packaging\windows\riomat.iss` (Inno Setup 6).
+
+## Logo e iconos
+`assets/logo.svg` es el original. `scripts/generar-iconos.sh` regenera los PNG y `icon.ico` (necesita `rsvg-convert` y ImageMagick).
+El `.exe` de Windows lleva el icono incrustado (`crates/riomat/build.rs`); en Linux lo toma del `.desktop` instalado.
 
 ## Uso
 ```sh

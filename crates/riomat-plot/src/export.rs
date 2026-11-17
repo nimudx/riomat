@@ -55,6 +55,7 @@ mod tests {
             titulo: "Prueba de figura".into(),
             series: vec![Serie { nombre: "Serie A".into(), puntos: (0..20).map(|i| (i as f64, (i as f64 / 3.0).sin().abs())).collect(), color: 0xd55e00, grosor: 2.2, relleno: true, opaca: true }],
             marcas: vec![Marca { x: 10.0, y: 0.5, color: 0x0e7c86 }],
+            mapa: None,
             ejes: Ejes { x: (0.0, 20.0), y: (0.0, 1.0), y_log: false, x_log: false, x_ticks: ticks_lineales(0.0, 20.0, 5), y_ticks: ticks_lineales(0.0, 1.0, 5), x_titulo: "Distancia (km)".into(), y_titulo: "Concentración (×10⁻⁶)".into() },
         }
     }
@@ -67,6 +68,30 @@ mod tests {
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         assert!(png.len() > 2000);
         let pdf = svg_a_pdf(&svg).unwrap();
+        assert_eq!(&pdf[..5], b"%PDF-");
+    }
+
+    #[test]
+    fn mapa_de_calor_e_informe_generan_pdf() {
+        use crate::{Informe, Mapa, informe_svg};
+        let (nx, ny) = (30, 12);
+        let colores: Vec<u32> = (0..nx * ny).map(|k| 0x200000 + ((k * 200 / (nx * ny)) as u32) * 0x010100).collect();
+        let mut f = ejemplo();
+        f.mapa = Some(Mapa { nx, ny, colores, barra: (0..16).map(|k| 0x102030 + k * 0x0a0a0a).collect(), barra_max: "5.0 ×10⁻⁶".into(), barra_titulo: "Concentración".into() });
+        let svg = a_svg(&f, 720.0, 380.0);
+        assert!(svg.matches("<rect").count() > nx * ny);
+        assert!(svg_a_png(&svg, 1.0).is_ok());
+        let inf = Informe {
+            titulo: "Informe de prueba".into(),
+            subtitulo: "Riomat".into(),
+            parametros: (0..9).map(|k| (format!("parametro {k}"), format!("valor {k}"))).collect(),
+            tabla: vec![vec!["Caudal".into(), "Correlación".into(), "t50".into()], vec!["PF 1".into(), "Fischer".into(), "53.5".into()]],
+            figuras: vec![ejemplo(), f],
+            avisos: (0..40).map(|k| format!("aviso número {k} con un texto bastante largo para obligar a partir la línea en varias partes y comprobar que no se sale de la página")).collect(),
+            alcance: "Trazador pasivo.".into(),
+            pie: "pie".into(),
+        };
+        let pdf = svg_a_pdf(&informe_svg(&inf)).unwrap();
         assert_eq!(&pdf[..5], b"%PDF-");
     }
 
